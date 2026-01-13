@@ -67,6 +67,19 @@ class QosTxop : public Txop
     void SetDroppedMpduCallback(DroppedMpdu callback) override;
 
     /**
+     * @brief Set the P-EDCA backoff bypass flag.
+     * 
+     * When this flag is true, the next call to NotifyChannelReleased will
+     * skip backoff generation and use backoff=0 instead. This is used in
+     * P-EDCA Stage 2 to ensure immediate data transmission.
+     *
+     * @param bypass true to bypass backoff, false for normal operation
+     * @param linkId the ID of the link
+     */
+    void SetPedcaBypassBackoff(bool bypass, uint8_t linkId);
+
+
+    /**
      * Get the access category of this object.
      *
      * @return the access category.
@@ -421,6 +434,9 @@ class QosTxop : public Txop
         uint8_t muAifsn{0};            //!< the MU AIFSN
         Time muEdcaTimer{0};           //!< the MU EDCA Timer
         Time muEdcaTimerStartTime{0};  //!< last start time of the MU EDCA Timer
+        
+        // P-EDCA support
+        bool pedcaBypassBackoff{false}; //!< skip backoff generation in P-EDCA Stage 2
     };
 
     void DoDispose() override;

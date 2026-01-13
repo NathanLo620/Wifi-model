@@ -44,7 +44,8 @@ NS_LOG_COMPONENT_DEFINE("WifiMac");
 NS_OBJECT_ENSURE_REGISTERED(WifiMac);
 
 WifiMac::WifiMac()
-    : m_qosSupported(false)
+    : m_qosSupported(false),
+      m_pedcaSupported(false)
 {
     NS_LOG_FUNCTION(this);
 
@@ -78,6 +79,13 @@ WifiMac::GetTypeId()
                               TypeId::ATTR_CONSTRUCT, // prevent setting after construction
                           BooleanValue(false),
                           MakeBooleanAccessor(&WifiMac::SetQosSupported, &WifiMac::GetQosSupported),
+                          MakeBooleanChecker())
+            .AddAttribute("PedcaSupported",
+                          "This Boolean attribute is set to enable P-EDCA (Prioritized EDCA) support "
+                          "at this STA. When enabled, AC_VO traffic may trigger specific protection mechanisms "
+                          "like CTS-to-Self.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&WifiMac::SetPedcaSupported, &WifiMac::GetPedcaSupported),
                           MakeBooleanChecker())
             .AddAttribute("CtsToSelfSupported",
                           "Use CTS to Self when using a rate that is not in the basic rate set.",
@@ -1409,6 +1417,19 @@ bool
 WifiMac::GetQosSupported() const
 {
     return m_qosSupported;
+}
+
+void
+WifiMac::SetPedcaSupported(bool enable)
+{
+    NS_LOG_FUNCTION(this << enable);
+    m_pedcaSupported = enable;
+}
+
+bool
+WifiMac::GetPedcaSupported() const
+{
+    return m_pedcaSupported;
 }
 
 bool

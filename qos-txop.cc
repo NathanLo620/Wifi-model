@@ -222,6 +222,13 @@ QosTxop::SetMuEdcaTimer(Time timer, uint8_t linkId)
 }
 
 void
+QosTxop::SetPedcaBypassBackoff(bool bypass, uint8_t linkId)
+{
+    NS_LOG_FUNCTION(this << bypass << +linkId);
+    GetLink(linkId).pedcaBypassBackoff = bypass;
+}
+
+void
 QosTxop::StartMuEdcaTimerNow(uint8_t linkId)
 {
     NS_LOG_FUNCTION(this << +linkId);
@@ -636,15 +643,38 @@ QosTxop::NotifyChannelReleased(uint8_t linkId)
         m_txopTrace(*link.startTxop, Simulator::Now() - *link.startTxop, linkId);
     }
 
-    // generate a new backoff value if either the TXOP duration is not null (i.e., some frames
+    // P-EDCA support: If pedcaBypassBackoff flag is set, this is a P-EDCA Stage 2 release.
+    // We must FORCE generate a new backoff (using P-EDCA CW=7) and immediately RequestAccess.
+    // The normal path might skip this if hasTransmitted=false and GetGenerateBackoffOnNoTx()=false.
+    if (link.pedcaBypassBackoff)
+    {
+        // Clear the flag
+        link.pedcaBypassBackoff = false;
+        
+        // Generate a random P-EDCA backoff (0-7 slots)
+        GenerateBackoff(linkId);
+        uint32_t backoffSlots = GetBackoffSlots(linkId);
+        
+        NS_LOG_INFO("P-EDCA Stage2: Backoff=" << backoffSlots 
+                     << " slots, CW=" << GetCw(linkId) << ", AIFSN=" << +GetAifsn(linkId));
+        
+        // Reset state
+        link.startTxop.reset();
+        link.access = NOT_REQUESTED;
+        
+        // ALWAYS request access for P-EDCA Stage 2
+        if (!m_queue->IsEmpty())
+        {
+            Simulator::ScheduleNow(&QosTxop::RequestAccess, this, linkId);
+        }
+        return;
+    }
+
+
+    // Normal path: generate a new backoff value if either the TXOP duration is not null (i.e., some frames
     // were transmitted) or no frame was transmitted but the queue actually contains frame to
     // transmit and the user indicated that a backoff value should be generated in this situation.
-    // This behavior reflects the following specs text (Sec. 35.3.16.4 of 802.11be D4.0):
-    // An AP or non-AP STA affiliated with an MLD that has gained the right to initiate the
-    // transmission of a frame as described in 10.23.2.4 (Obtaining an EDCA TXOP) for an AC but
-    // does not transmit any frame corresponding to that AC for the reasons stated above may:
-    // - invoke a backoff for the EDCAF associated with that AC as allowed per h) of 10.23.2.2
-    //   (EDCA backoff procedure).
+    // This behavior reflects the following specs text (Sec. 35.3.16.4 of 802.11be D4.0)
     auto hasTransmitted = link.startTxop.has_value() && Simulator::Now() > *link.startTxop;
 
     m_queue->WipeAllExpiredMpdus();
@@ -652,6 +682,14 @@ QosTxop::NotifyChannelReleased(uint8_t linkId)
         (!m_queue->IsEmpty() && m_mac->GetChannelAccessManager(linkId)->GetGenerateBackoffOnNoTx()))
     {
         GenerateBackoff(linkId);
+        
+        // P-EDCA Debug: Log the generated backoff for VO traffic
+        if (GetAccessCategory() == AC_VO)
+        {
+            NS_LOG_DEBUG("P-EDCA: GenerateBackoff for VO, backoff slots=" 
+                         << GetBackoffSlots(linkId) << ", CW=" << GetCw(linkId));
+        }
+        
         if (!m_queue->IsEmpty())
         {
             Simulator::ScheduleNow(&QosTxop::RequestAccess, this, linkId);
@@ -852,6 +890,7 @@ QosTxop::GetFailedAddBaTimeout() const
 {
     return m_failedAddBaTimeout;
 }
+
 
 bool
 QosTxop::IsQosTxop() const

@@ -217,6 +217,13 @@ class QosFrameExchangeManager : public FrameExchangeManager
     bool m_pifsRecovery;         //!< true if performing a PIFS recovery after failure
     EventId m_pifsRecoveryEvent; //!< event associated with an attempt of PIFS recovery
     Ptr<Txop> m_edcaBackingOff;  //!< channel access function that invoked backoff during TXOP
+
+    // P-EDCA state variables
+    bool m_pedcaPending{false};              //!< True if DS-CTS was sent and we are in P-EDCA backoff
+    bool m_pedcaOriginalParamsSaved{false};  //!< True if original EDCA params have been saved
+    uint32_t m_savedCwMin{0};                //!< Saved initial CWmin
+    uint32_t m_savedCwMax{0};                //!< Saved initial CWmax
+    uint8_t m_savedAifsn{0};                 //!< Saved initial AIFSN
 };
 
 } // namespace ns3

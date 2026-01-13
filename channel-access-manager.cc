@@ -1333,7 +1333,14 @@ void
 ChannelAccessManager::NotifyNavStartNow(Time duration)
 {
     NS_LOG_FUNCTION(this << duration);
-    NS_LOG_DEBUG("nav start for=" << duration);
+    
+    // Log P-EDCA relevant NAV updates (97us or close)
+    if (duration.GetMicroSeconds() >= 90 && duration.GetMicroSeconds() <= 100)
+    {
+        NS_LOG_INFO("[NAV] P-EDCA CTS received: NAV=" << duration.GetMicroSeconds() 
+                     << "us at t=" << Simulator::Now().GetMicroSeconds() << "us");
+    }
+    
     UpdateBackoff();
     m_lastNavEnd = std::max(m_lastNavEnd, Simulator::Now() + duration);
 }

@@ -301,6 +301,17 @@ class WifiMac : public Object
      */
     void SetPromisc();
     /**
+     * Enable or disable P-EDCA support.
+     *
+     * @param enable true if P-EDCA is supported, false otherwise
+     */
+    void SetPedcaSupported(bool enable);
+    /**
+     * @return true if P-EDCA is supported, false otherwise
+     */
+    bool GetPedcaSupported() const;
+
+    /**
      * Enable or disable CTS-to-self feature.
      *
      * @param enable true if CTS-to-self is to be supported,
@@ -979,7 +990,7 @@ class WifiMac : public Object
      * Update the TID-to-Link Mappings for the given MLD in the given direction based on the
      * given negotiated mappings. An empty mapping indicates the default mapping.
      *
-     * @param mldAddr the MLD address of the given MLD
+     * @param mldAddr the MLD MAC address of the given MLD
      * @param dir the given direction (DL or UL)
      * @param mapping the negotiated TID-to-Link Mapping
      */
@@ -1241,10 +1252,10 @@ class WifiMac : public Object
      * state. Having a big switch seems like a good intermediate stage,
      * however.
      */
-    bool m_qosSupported;
-
+    bool m_qosSupported;         //!< whether QoS is supported
+    bool m_pedcaSupported;       //!< whether P-EDCA is supported
     bool m_shortSlotTimeSupported; ///< flag whether short slot time is supported
-    bool m_ctsToSelfSupported;     ///< flag indicating whether CTS-To-Self is supported
+    bool m_ctsToSelfSupported;     //!< whether CTS-to-Self is supported
 
     TypeOfStation m_typeOfStation; //!< the type of station
 

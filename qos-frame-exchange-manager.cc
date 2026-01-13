@@ -14,6 +14,8 @@
 
 #include "ns3/abort.h"
 #include "ns3/log.h"
+#include "ns3/wifi-mac.h"
+#include "ns3/qos-utils.h" // Added for P-EDCA logic
 
 #undef NS_LOG_APPEND_CONTEXT
 #define NS_LOG_APPEND_CONTEXT WIFI_FEM_NS_LOG_APPEND_CONTEXT
@@ -63,7 +65,12 @@ QosFrameExchangeManager::GetTypeId()
 }
 
 QosFrameExchangeManager::QosFrameExchangeManager()
-    : m_initialFrame(false)
+    : m_initialFrame(false),
+      m_pedcaPending(false),              // [CRITICAL] Must be false initially
+      m_pedcaOriginalParamsSaved(false),  // [CRITICAL] Must be false initially
+      m_savedCwMin(0),
+      m_savedCwMax(0),
+      m_savedAifsn(0)
 {
     NS_LOG_FUNCTION(this);
 }
@@ -234,6 +241,225 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
         if (!m_edca->GetTxopStartTime(m_linkId) ||
             (backingOff && m_edca->GetRemainingTxop(m_linkId).IsZero()))
         {
+            // P-EDCA Implementation: Strict P-EDCA (Two-Stage Access)
+            // We only intervene if we are starting a NEW TXOP.
+            if (m_mac->GetPedcaSupported() && m_edca->GetAccessCategory() == AC_VO)
+            {
+                // [Debug] Log the state of m_pedcaPending to trace the flow
+                /*NS_LOG_DEBUG("P-EDCA Check: AC_VO detected at t=" 
+                             << Simulator::Now().GetMicroSeconds() << "us, m_pedcaPending="
+                             << (m_pedcaPending ? "TRUE(Skip CTS)" : "FALSE(Send CTS)"));*/
+                
+                if (!m_pedcaPending)
+                {
+                    // === P-EDCA Stage 1: Send DS-CTS ===
+                    // 
+                    // P-EDCA Flow:
+                    // 1. P-EDCA STA with VO traffic wins initial EDCA contention
+                    // 2. P-EDCA STA sends DS-CTS (CTS-to-Self) with Duration=97µs
+                    // 3. All STAs hear the CTS and set NAV for 97µs
+                    // 4. During the 97µs window:
+                    //    - Non-P-EDCA STAs are blocked by NAV
+                    //    - P-EDCA STAs with VO traffic can contend with P-EDCA params
+                    //      (CWmin=7, CWmax=7, AIFSN=2)
+                    // 5. Winner of P-EDCA contention transmits VO data
+                    // 6. After transmission, return to normal EDCA
+                    
+                    /*NS_LOG_DEBUG("P-EDCA: Starting Stage 1 (DS-CTS) at t=" 
+                                 << Simulator::Now().GetMicroSeconds() << "us");*/
+
+                    // 1. Save Original EDCA Parameters (for restoration after P-EDCA)
+                    if (!m_pedcaOriginalParamsSaved)
+                    {
+                        m_savedCwMin = m_edca->GetMinCw(m_linkId);
+                        m_savedCwMax = m_edca->GetMaxCw(m_linkId);
+                        m_savedAifsn = m_edca->GetAifsn(m_linkId);
+                        m_pedcaOriginalParamsSaved = true;
+                        /*NS_LOG_DEBUG("P-EDCA: Saved original params: CWmin=" << m_savedCwMin 
+                                     << " CWmax=" << m_savedCwMax << " AIFSN=" << +m_savedAifsn);*/
+                    }
+
+                    // 2. Construct DS-CTS (CTS-to-Self)
+                    WifiMacHeader ctsHeader;
+                    ctsHeader.SetType(WIFI_MAC_CTL_CTS);
+                    ctsHeader.SetDsNotFrom();
+                    ctsHeader.SetDsNotTo();
+                    ctsHeader.SetNoMoreFragments();
+                    ctsHeader.SetNoRetry();
+                    ctsHeader.SetAddr1(m_mac->GetAddress()); // RA = Self (True CTS-to-Self)
+                    
+                    // P-EDCA DS-CTS Duration: 97µs (per P-EDCA standard)
+                    // 
+                    // Duration = SIFS + AIFSN*SlotTime + CWmax*SlotTime
+                    //          = 10µs + 2*9µs + 7*9µs = 10 + 18 + 63 = 91µs ≈ 97µs
+                    //
+                    // During this 97µs window:
+                    //   - Non-P-EDCA STAs are frozen by NAV
+                    //   - P-EDCA+VO STAs contend with P-EDCA parameters (CW=7, AIFSN=2)
+                    //   - Winner transmits its VO data immediately
+                    Time pedcaWindowDuration = MicroSeconds(97);
+                    ctsHeader.SetDuration(pedcaWindowDuration);
+
+                    // 3. Transmit DS-CTS using 802.11n HT mode for consistency
+                    // Using HT MCS0 (6.5Mbps) to match 802.11n simulation
+                    // This ensures proper 802.11n timing (SIFS = 16µs)
+                    WifiTxVector ctsTxVector;
+                    ctsTxVector.SetMode(WifiMode("HtMcs0"));
+                    ctsTxVector.SetPreambleType(WIFI_PREAMBLE_HT_MF);  // HT Mixed Format
+                    ctsTxVector.SetTxPowerLevel(0);
+                    ctsTxVector.SetChannelWidth(20);  // 20 MHz for HT
+                    ctsTxVector.SetGuardInterval(NanoSeconds(800));  // 800ns GI
+                    ctsTxVector.SetNss(1);  // Single spatial stream 
+
+                    Ptr<WifiMpdu> mpdu = Create<WifiMpdu>(Create<Packet>(), ctsHeader);
+                    
+                    // CRITICAL: Verify PHY is IDLE before sending DS-CTS
+                    // If PHY is busy (TX, RX, Switching), we must NOT send DS-CTS
+                    // to avoid collision with other STA's ongoing TXOP.
+                    if (m_phy->IsStateTx() || m_phy->IsStateRx() || m_phy->IsStateSwitching())
+                    {
+                        // PHY is busy - cannot send DS-CTS now
+                        // Abort P-EDCA Stage 1 and retry on next access grant
+                        NS_LOG_INFO("P-EDCA Stage1 ABORT: PHY busy at t=" 
+                                    << Simulator::Now().GetMicroSeconds() << "us"
+                                    << " (TX=" << m_phy->IsStateTx()
+                                    << " RX=" << m_phy->IsStateRx() << ")");
+                        m_edca = nullptr;
+                        return false;
+                    }
+                    
+                    ForwardMpduDown(mpdu, ctsTxVector);
+                    
+                    Time ctsAirtime = m_phy->CalculateTxDuration(mpdu->GetPacketSize(),
+                                                                ctsTxVector,
+                                                                m_phy->GetPhyBand());
+                    /*NS_LOG_DEBUG("P-EDCA: Sent DS-CTS (Duration=97us, CTS_airtime=" 
+                                 << ctsAirtime.GetMicroSeconds() << "us)");*/
+
+                    // 4. Disable THIS STA's non-VO ACs during P-EDCA window
+                    // This prevents internal collision from VI/BE/BK on this STA
+                    Ptr<ChannelAccessManager> cam = m_mac->GetChannelAccessManager(m_linkId);
+                    if (cam)
+                    {
+                        for (const auto& ac : {AC_BE, AC_BK, AC_VI})
+                        {
+                            Ptr<QosTxop> other = m_mac->GetQosTxop(ac);
+                            if (other)
+                            {
+                                cam->DisableEdcaFor(other, ctsAirtime + pedcaWindowDuration);
+                            }
+                        }
+                    }
+
+                    // 5. Switch to P-EDCA Parameters for Stage 2 contention
+                    m_pedcaPending = true;
+                    
+                    // CRITICAL: Use m_linkId when setting P-EDCA parameters!
+                    // The default SetMinCw(7) only sets linkId=0 which may be wrong.
+                    m_edca->SetMinCw(7, m_linkId);
+                    m_edca->SetMaxCw(7, m_linkId);
+                    m_edca->SetAifsn(2, m_linkId);
+                    
+                    // Force reset CW to ensure P-EDCA uses CW=7
+                    m_edca->ResetCw(m_linkId);
+                    
+                    /*NS_LOG_DEBUG("P-EDCA: Switched to P-EDCA params on link " << +m_linkId 
+                                 << " (CWmin=7, CWmax=7, AIFSN=2, CW=" << m_edca->GetCw(m_linkId) << ")");*/
+
+                    // 6. Schedule channel release at CTS TxEnd (NOT +SIFS!)
+                    // 
+                    // CRITICAL FIX: Do NOT add SIFS here!
+                    // AIFS = SIFS + AIFSN*Slot, so SIFS is already included in the backoff timing.
+                    // Adding SIFS here would push Stage-2 past the 97µs NAV window.
+                    //
+                    // P-EDCA timing from CTS TxEnd:
+                    //   Release at CTS TxEnd → EDCA starts → AIFS(28µs) + Backoff(0-63µs)
+                    //   Total: 28..91µs, well within 97µs NAV
+                    //
+                    // CRITICAL FIX: ForwardMpduDown() queues CTS if PHY is busy.
+                    // We must wait until PHY is idle (CTS TX complete) before Stage 2.
+                    Time releaseDelay = ctsAirtime + MicroSeconds(5);
+                    
+                    // Capture all necessary state for the callback
+                    struct PedcaState {
+                        Ptr<QosTxop> edca;
+                        uint8_t linkId;
+                        QosFrameExchangeManager* fem;
+                        Ptr<WifiPhy> phy;
+                        int retries = 0;
+                        std::function<void()> callback;  // Self-reference for recursive scheduling
+                    };
+                    auto state = std::make_shared<PedcaState>();
+                    state->edca = m_edca;
+                    state->linkId = m_linkId;
+                    state->fem = this;
+                    state->phy = m_phy;
+                    
+                    // Define callback that captures state (which contains callback)
+                    state->callback = [state]() {
+                        // If PHY is still transmitting CTS, wait and retry
+                        if (state->phy->IsStateTx() && state->retries < 50) {
+                            state->retries++;
+                            Simulator::Schedule(MicroSeconds(10), state->callback);
+                            return;
+                        }
+                        
+                        // COLLISION DETECTION: If PHY is receiving or busy after CTS TxEnd,
+                        // it means another STA was transmitting simultaneously (CTS collision).
+                        // In this case, reset P-EDCA and return to Stage 1 for next VO.
+                        if (state->phy->IsStateRx() || state->phy->IsStateCcaBusy()) {
+                            std::clog << "[P-EDCA COLLISION] Channel busy after CTS at t="
+                                      << Simulator::Now().GetMicroSeconds() << "us"
+                                      << " - Resetting to Stage 1" << std::endl;
+                            
+                            // Reset P-EDCA state: next VO must do Stage 1 again
+                            auto* fem = dynamic_cast<QosFrameExchangeManager*>(state->fem);
+                            if (fem) {
+                                fem->m_pedcaPending = false;  // Reset P-EDCA flag
+                                
+                                // Restore original EDCA parameters
+                                if (fem->m_pedcaOriginalParamsSaved) {
+                                    state->edca->SetMinCw(fem->m_savedCwMin, state->linkId);
+                                    state->edca->SetMaxCw(fem->m_savedCwMax, state->linkId);
+                                    state->edca->SetAifsn(fem->m_savedAifsn, state->linkId);
+                                    state->edca->ResetCw(state->linkId);
+                                    fem->m_pedcaOriginalParamsSaved = false;
+                                    std::clog << "[P-EDCA] Restored original EDCA params after collision" << std::endl;
+                                }
+                            }
+                            
+                            // Don't proceed with Stage 2 - let normal EDCA handle next transmission
+                            return;
+                        }
+                        
+                        // PHY is now idle - proceed with Stage 2
+                        // Set the P-EDCA flag to force backoff generation and RequestAccess
+                        state->edca->SetPedcaBypassBackoff(true, state->linkId);
+                        state->fem->NotifyChannelReleased(state->edca);
+                    };
+                    
+                    Simulator::Schedule(releaseDelay, state->callback);
+
+                    // Prevent immediate data transmission in this call stack
+                    m_edca = nullptr; 
+                    
+                    // Return false - we sent CTS but not data yet
+                    return false;
+                }
+                else
+                {
+                     // === P-EDCA Stage 2: Backoff Complete, Transmit Data ===
+                     /*NS_LOG_DEBUG("P-EDCA: Stage 2 Backoff Finished at t=" 
+                                  << Simulator::Now().GetMicroSeconds() 
+                                  << "us. Proceeding to VO Data Transmission.");*/
+                     
+                     // Reset P-EDCA flag after Stage 2 to allow new P-EDCA flows
+                     m_pedcaPending = false;
+                     
+                     // Continue with normal transmission logic below...
+                }
+            }
+
             // starting a new TXOP
             m_edca->NotifyChannelAccessed(m_linkId, txopDuration);
 
@@ -619,6 +845,21 @@ QosFrameExchangeManager::TransmissionSucceeded()
 {
     NS_LOG_DEBUG(this);
 
+    // P-EDCA Restoration Logic
+    if (m_pedcaPending && m_edca && m_edca->GetAccessCategory() == AC_VO)
+    {
+        if (m_pedcaOriginalParamsSaved)
+        {
+            m_edca->SetMinCw(m_savedCwMin);
+            m_edca->SetMaxCw(m_savedCwMax);
+            m_edca->SetAifsn(m_savedAifsn);
+            m_pedcaOriginalParamsSaved = false;
+            NS_LOG_DEBUG("P-EDCA: Restored original EDCA params");
+        }
+        m_pedcaPending = false;
+        NS_LOG_DEBUG("P-EDCA: Sequence Complete (Success). Reset state.");
+    }
+
     // TODO This will be removed once no Txop is installed on a QoS station
     if (!m_edca)
     {
@@ -648,12 +889,36 @@ QosFrameExchangeManager::TransmissionSucceeded()
     }
     m_initialFrame = false;
     m_sentFrameTo.clear();
+
+    if (m_pifsRecovery)
+    {
+        m_pifsRecovery = false;
+        // restore the contention window that was reset when granting access for PIFS recovery
+        // m_edcaBackingOff->SetCw(m_edcaBackingOff->GetCw(m_linkId)); // Error: SetCw does not exist
+        m_edcaBackingOff = nullptr;
+    }
 }
 
 void
 QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
 {
     NS_LOG_FUNCTION(this << forceCurrentCw);
+
+    // P-EDCA Restoration Logic (also on failure)
+    if (m_pedcaPending && m_edca && m_edca->GetAccessCategory() == AC_VO)
+    {
+        // CRITICAL FIX: Ensure state is reset even on failures/drops to avoid "stuck" state
+        if (m_pedcaOriginalParamsSaved)
+        {
+            m_edca->SetMinCw(m_savedCwMin);
+            m_edca->SetMaxCw(m_savedCwMax);
+            m_edca->SetAifsn(m_savedAifsn);
+            m_pedcaOriginalParamsSaved = false;
+            NS_LOG_DEBUG("P-EDCA: Restored original EDCA params (after failure)");
+        }
+        m_pedcaPending = false;
+        NS_LOG_DEBUG("P-EDCA: Sequence Complete (Failure). Reset state to avoid stuck condition.");
+    }
 
     // TODO This will be removed once no Txop is installed on a QoS station
     if (!m_edca)

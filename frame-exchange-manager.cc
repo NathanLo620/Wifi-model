@@ -321,6 +321,16 @@ FrameExchangeManager::ReceivedMacHdr(const WifiMacHeader& macHdr,
                                      Time psduDuration)
 {
     NS_LOG_FUNCTION(this << macHdr << txVector << psduDuration.As(Time::MS));
+    
+    // P-EDCA Debug: Log when CTS frames are received at MAC header level
+    if (macHdr.IsCts())
+    {
+        NS_LOG_DEBUG("P-EDCA-DEBUG: ReceivedMacHdr CTS! RA=" << macHdr.GetAddr1()
+                     << " Duration=" << macHdr.GetDuration().GetMicroSeconds() << "us"
+                     << " psduDuration=" << psduDuration.GetMicroSeconds() << "us"
+                     << " m_self=" << m_self);
+    }
+    
     m_ongoingRxInfo = {macHdr, txVector, Simulator::Now() + psduDuration};
     UpdateNav(macHdr, txVector, psduDuration);
 }
@@ -1308,17 +1318,29 @@ FrameExchangeManager::UpdateNav(const WifiMacHeader& hdr,
 
     if (!hdr.HasNav())
     {
+        NS_LOG_DEBUG("P-EDCA-DEBUG: Frame has no NAV field, skipping NAV update");
         return;
     }
 
     Time duration = hdr.GetDuration();
     NS_LOG_DEBUG("Duration/ID=" << duration);
+    
+    // P-EDCA Debug: Log CTS frames specifically
+    if (hdr.IsCts())
+    {
+        NS_LOG_DEBUG("P-EDCA-DEBUG: Received CTS frame! RA=" << hdr.GetAddr1() 
+                     << " Duration=" << duration.GetMicroSeconds() << "us"
+                     << " surplus=" << surplus.GetMicroSeconds() << "us"
+                     << " m_self=" << m_self);
+    }
+    
     duration += surplus;
 
     if (hdr.GetAddr1() == m_self)
     {
         // When the received frame's RA is equal to the STA's own MAC address, the STA
         // shall not update its NAV (IEEE 802.11-2016, sec. 10.3.2.4)
+        NS_LOG_DEBUG("P-EDCA-DEBUG: Frame RA=" << hdr.GetAddr1() << " equals m_self, NOT updating NAV");
         return;
     }
 
