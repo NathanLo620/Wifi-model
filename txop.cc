@@ -409,6 +409,16 @@ Txop::UpdateFailedCw(uint8_t linkId)
     m_cwTrace(link.cw, linkId);
 }
 
+void
+Txop::SetCw(uint32_t cw, uint8_t linkId)
+{
+    NS_LOG_FUNCTION(this << cw << linkId);
+    auto& link = GetLink(linkId);
+    // Clamp CW to valid range [cwMin, cwMax]
+    link.cw = std::min(std::max(cw, link.cwMin), link.cwMax);
+    m_cwTrace(link.cw, linkId);
+}
+
 uint32_t
 Txop::GetBackoffSlots(uint8_t linkId) const
 {

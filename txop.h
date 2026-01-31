@@ -314,6 +314,16 @@ class Txop : public Object
     uint32_t GetCw(uint8_t linkId) const;
 
     /**
+     * Set the current contention window for the given link.
+     * Used by P-EDCA to directly set CW based on the QSRC formula:
+     * CW = min(CWmax, 2^QSRC × (CWmin + 1) - 1)
+     *
+     * @param cw the new CW value (will be clamped to [CWmin, CWmax])
+     * @param linkId the ID of the given link
+     */
+    void SetCw(uint32_t cw, uint8_t linkId);
+
+    /**
      * Get the Station Short Retry Count (SSRC) maintained by non-QoS stations or the QoS STA
      * Retry Count (QSRC) maintained by QoS STAs for each AC on the given link.
      *

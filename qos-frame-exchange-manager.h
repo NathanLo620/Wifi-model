@@ -220,10 +220,20 @@ class QosFrameExchangeManager : public FrameExchangeManager
 
     // P-EDCA state variables
     bool m_pedcaPending{false};              //!< True if DS-CTS was sent and we are in P-EDCA backoff
-    bool m_pedcaOriginalParamsSaved{false};  //!< True if original EDCA params have been saved
-    uint32_t m_savedCwMin{0};                //!< Saved initial CWmin
-    uint32_t m_savedCwMax{0};                //!< Saved initial CWmax
-    uint8_t m_savedAifsn{0};                 //!< Saved initial AIFSN
+    
+    // P-EDCA PSRC/QSRC counters (per 802.11be spec)
+    uint8_t m_psrc{0};                       //!< P-EDCA STA Retry Counter (consecutive DS-CTS attempts)
+    uint16_t m_qsrc{0};                      //!< Queue Size Retry Counter (tracks VO retry conditions)
+    
+    // P-EDCA thresholds (configurable, per 802.11be draft spec)
+    static constexpr uint16_t PEDCA_RETRY_THRESHOLD = 2;       //!< dot11PEDCARetryThreshold (default=2)
+    static constexpr uint8_t PEDCA_CONSECUTIVE_ATTEMPT = 1;    //!< dot11PEDCAConsecutiveAttempt (draft D1.1 default=1)
+    
+    // P-EDCA timing tracking for verification
+    Time m_pedcaCtsTxEnd{0};  //!< DS-CTS transmission end time for timing verification
+    
+    // P-EDCA Stage 2 collision tracking
+    bool m_pedcaStage2Active{false};  //!< True when in P-EDCA Stage 2 contention
 };
 
 } // namespace ns3
