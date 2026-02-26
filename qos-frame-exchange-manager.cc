@@ -9,6 +9,7 @@
 #include "qos-frame-exchange-manager.h"
 
 #include "ap-wifi-mac.h"
+#include "channel-access-manager.h"
 #include "wifi-mac-queue.h"
 #include "wifi-mac-trailer.h"
 
@@ -276,6 +277,23 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                      // If deferral is required, we effectively "do NOT schedule DS-CTS".
                      // We must abort this access attempt to respect the deferral rules.
                      NotifyChannelReleased(m_edca);
+                     
+                     // P-EDCA TIMING FIX:
+                     // If we defer P-EDCA (e.g. due to busy medium), we should retry ASAP (AIFS + 0).
+                     // Force backoff to 0 slots if P-EDCA conditions are met.
+                     if (qsrcOk && psrcOk)
+                     {
+                         // std::clog << "[P-EDCA OVERRIDE] Forcing Backoff=0 for deferred P-EDCA attempt" << std::endl;
+                         Ptr<ChannelAccessManager> cam = m_mac->GetChannelAccessManager(m_linkId);
+                         if (cam) 
+                         {
+                             Time slot = m_phy->GetSlot();
+                             Time accessGrantStart = cam->GetAccessGrantStart(); 
+                             Time backoffEnd = accessGrantStart + m_edca->GetAifsn(m_linkId) * slot;
+                             m_edca->UpdateBackoffSlotsNow(0, backoffEnd, m_linkId);
+                         }
+                     }
+                     
                      m_edca = nullptr;
                      return false;
                 }
@@ -283,8 +301,67 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                 if (!m_pedcaPending && qsrcOk && psrcOk)
                 {
                     // === P-EDCA Stage 1: Send DS-CTS ===
+                    // 
+                    // P-EDCA TIMING:
+                    // DS-CTS is sent at DSAIFS = SIFS + (AIFSN + DSr) × SlotTime
+                    // With DSr=0, AIFSN=2: DSAIFS = 16µs + 2×9µs = 34µs after last busy end.
+                    //
+                    // P-EDCA VO has higher internal priority than normal EDCA VO.
+                    // TransmissionFailed forces backoff=0 when P-EDCA conditions are met,
+                    // so the STA accesses the channel after only AIFS (no random backoff).
+                    // No virtual collision bypass is needed.
+                    
+                    Time nowTime = Simulator::Now();
+                    
+                    // Get the access grant start (last busy end + SIFS)
+                    // This tells us when the channel became idle for contention
+                    Ptr<ChannelAccessManager> cam = m_mac->GetChannelAccessManager(m_linkId);
+                    Time accessGrantStart = Seconds(0);
+                    if (cam)
+                    {
+                        accessGrantStart = cam->GetAccessGrantStart();
+                    }
+                    
+                    // Calculate expected DSAIFS timing
+                    // DSAIFS = SIFS + (AIFSN + DSr) × SlotTime
+                    // accessGrantStart already includes SIFS, so we add AIFSN × SlotTime
+                    Time sifs = m_phy->GetSifs();  // 16µs for 5GHz OFDM
+                    Time slotTime = m_phy->GetSlot();  // 9µs for OFDM
+                    uint8_t aifsn = 2;  // P-EDCA AIFSN for DS-CTS
+                    uint8_t dsr = 0;    // DSr randomization (currently 0, CWds not implemented)
+                    
+                    // Expected time for DS-CTS = accessGrantStart + AIFSN × SlotTime + DSr × SlotTime
+                    // But accessGrantStart = lastBusy + SIFS, so effective delay from lastBusy = SIFS + AIFSN × SlotTime
+                    Time expectedDsaifs = sifs + (aifsn + dsr) * slotTime;  // Should be 34µs
+                    Time lastBusyPlusSifs = accessGrantStart;  // accessGrantStart = lastBusy + SIFS
+                    Time expectedDsCtsTime = lastBusyPlusSifs + (aifsn + dsr) * slotTime;
+                    
+                    // Calculate actual gap from expected DS-CTS time
+                    Time actualGap = nowTime - expectedDsCtsTime;
+                    
+                    // For logging: calculate gap from when channel became available
+                    // This is (Now - accessGrantStart), which should be ~AIFSN×SlotTime = 18µs
+                    Time gapFromAccessGrant = nowTime - accessGrantStart;
+                    Time targetGapFromGrant = (aifsn + dsr) * slotTime; // 18us
+                    
                     std::clog << "[P-EDCA STAGE1] Sending DS-CTS at t=" 
-                              << Simulator::Now().GetMicroSeconds() << "us" << std::endl;
+                              << nowTime.GetMicroSeconds() << "us" << std::endl;
+                    
+                    if (gapFromAccessGrant > targetGapFromGrant + MicroSeconds(200)) {
+                         std::clog << "[P-EDCA TIMING] Gap from grant=" << gapFromAccessGrant.GetMicroSeconds()
+                                   << "us. Channel likely IDLE for long time. (OK)" << std::endl;
+                    } else if (std::abs(gapFromAccessGrant.GetMicroSeconds() - targetGapFromGrant.GetMicroSeconds()) < 2) {
+                         std::clog << "[P-EDCA TIMING] Gap from grant=" << gapFromAccessGrant.GetMicroSeconds()
+                                   << "us. Matches target " << targetGapFromGrant.GetMicroSeconds() << "us. (OK)" << std::endl;
+                         std::clog << "[P-EDCA TIMING] Total delay from Busy=" << (gapFromAccessGrant + sifs).GetMicroSeconds() 
+                                   << "us (Target=34us). OK." << std::endl;
+                    } else {
+                        // Warn if timing is significantly off from expected DSAIFS
+                        double backoffSlots = (double)(gapFromAccessGrant.GetMicroSeconds() - targetGapFromGrant.GetMicroSeconds()) / slotTime.GetMicroSeconds();
+                        std::clog << "[P-EDCA WARNING] DS-CTS sent late by " << backoffSlots 
+                                  << " slots. Gap=" << gapFromAccessGrant.GetMicroSeconds() 
+                                  << "us (Target=" << targetGapFromGrant.GetMicroSeconds() << "us)." << std::endl;
+                    }
 
                     // 2. Construct DS-CTS (CTS-to-Self)
                     WifiMacHeader ctsHeader;
@@ -335,7 +412,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
 
                     // 4. Disable THIS STA's non-VO ACs during P-EDCA window
                     // This prevents internal collision from VI/BE/BK on this STA
-                    Ptr<ChannelAccessManager> cam = m_mac->GetChannelAccessManager(m_linkId);
+                    // Note: cam was already declared above for timing verification
                     if (cam)
                     {
                         for (const auto& ac : {AC_BE, AC_BK, AC_VI})
@@ -368,19 +445,17 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     /*NS_LOG_DEBUG("P-EDCA: Switched to P-EDCA params on link " << +m_linkId 
                                  << " (CWmin=7, CWmax=7, AIFSN=2, CW=" << m_edca->GetCw(m_linkId) << ")");*/
 
-                    // 6. Schedule channel release at CTS TxEnd (NOT +SIFS!)
-                    // 
-                    // CRITICAL FIX: Do NOT add SIFS here!
-                    // AIFS = SIFS + AIFSN*Slot, so SIFS is already included in the backoff timing.
-                    // Adding SIFS here would push Stage-2 past the 97µs NAV window.
+                    // 6. Schedule channel release at CTS TxEnd
+                    //
+                    // Do NOT add SIFS here: AIFS = SIFS + AIFSN*Slot already includes SIFS.
                     //
                     // P-EDCA timing from CTS TxEnd:
-                    //   Release at CTS TxEnd → EDCA starts → AIFS(28µs) + Backoff(0-63µs)
-                    //   Total: 28..91µs, well within 97µs NAV
+                    //   Release at CTS TxEnd → EDCA AIFS(34µs) + Backoff(0-63µs)
+                    //   Total gap: [34, 97]µs — exactly the 97µs NAV window
                     //
-                    // CRITICAL FIX: ForwardMpduDown() queues CTS if PHY is busy.
-                    // We must wait until PHY is idle (CTS TX complete) before Stage 2.
-                    Time releaseDelay = ctsAirtime + MicroSeconds(5);
+                    // Schedule callback at exactly ctsAirtime (no extra padding).
+                    // If PHY is still in TX state, retry with 1µs granularity.
+                    Time releaseDelay = ctsAirtime;
                     
                     // Capture all necessary state for the callback
                     struct PedcaState {
@@ -402,9 +477,9 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     // Define callback that captures state (which contains callback)
                     state->callback = [state]() {
                         // If PHY is still transmitting CTS, wait and retry
-                        if (state->phy->IsStateTx() && state->retries < 50) {
+                        if (state->phy->IsStateTx() && state->retries < 200) {
                             state->retries++;
-                            Simulator::Schedule(MicroSeconds(10), state->callback);
+                            Simulator::Schedule(MicroSeconds(1), state->callback);
                             return;
                         }
                         // FIX: Do NOT check CCA busy here - other STAs' DS-CTS is expected!
@@ -416,7 +491,8 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                         // PHY is now idle - proceed with Stage 2
                         // CORRECT PLACE TO SET PENDING FLAG: Only when we actually start Stage 2 contention
                         state->fem->m_pedcaPending = true;
-                        state->fem->m_pedcaCtsTxEnd = state->ctsTxEnd;
+                        // Record actual CTS TX end = Simulator::Now() (PHY just became idle)
+                        state->fem->m_pedcaCtsTxEnd = Simulator::Now();
                         
                         // Set the P-EDCA flag to force backoff generation and RequestAccess
                         state->edca->SetPedcaBypassBackoff(true, state->linkId);
@@ -441,23 +517,24 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                      if (m_pedcaCtsTxEnd > Seconds(0))
                      {
                          Time gap = payloadStart - m_pedcaCtsTxEnd;
-                         double rawGapUs = gap.GetMicroSeconds();
-                         // Remove fixed PHY offset (20us) to get actual medium idle gap
-                         double adjustedGapUs = rawGapUs > 20.0 ? rawGapUs - 20.0 : 0.0;
+                         double gapUs = gap.GetMicroSeconds();
                          
                          std::clog << "[P-EDCA STAGE2] Payload TX start at t=" << payloadStart.GetMicroSeconds()
-                                   << "us, adjusted gap=" << adjustedGapUs << "us";
+                                   << "us, CTS TX end=" << m_pedcaCtsTxEnd.GetMicroSeconds()
+                                   << "us, gap=" << gapUs << "us";
 
                          // 97us is the HARD LIMIT from the 802.11be spec for P-EDCA window
-                         if (adjustedGapUs <= 97.0) {
+                         // Expected gap = AIFS + backoff = [34, 97]µs
+                         // AIFS = SIFS(16) + AIFSN(2)*Slot(9) = 34µs
+                         // Max backoff = CWmax(7)*Slot(9) = 63µs → total max = 97µs
+                         if (gapUs <= 97.0) {
                              std::clog << " ✓ TIMING OK" << std::endl;
                              stage2Valid = true;
                          } else {
-                             // If gap > 97us, the P-EDCA reservation has expired!
-                             // This can happen if medium was busy during backoff or we were deferred.
-                             // We MUST NOT transmit as a P-EDCA frame (Stage 2) anymore.
-                             // We should treat this as a failed P-EDCA attempt and revert to EDCA.
-                             std::clog << " ✗ TIMING EXPIRED (>97us) - Fallback to EDCA" << std::endl;
+                             // gap > 97µs: P-EDCA NAV reservation expired.
+                             // Medium was likely busy during Stage 2 contention.
+                             // Fallback to normal EDCA.
+                             std::clog << " ✗ TIMING EXPIRED (gap=" << gapUs << "us > 97us) - Fallback to EDCA" << std::endl;
                              stage2Valid = false;
                          }
                      }
@@ -1024,6 +1101,32 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
             m_edca->UpdateFailedCw(m_linkId);
         }
         NotifyChannelReleased(m_edca);
+        
+        // P-EDCA TIMING FIX:
+        // If P-EDCA conditions are met, we must NOT use the random backoff generated by NotifyChannelReleased.
+        // Instead, we must use DSr (random in [0, CWds], currently CWds=0 -> DSr=0).
+        // So we force backoff to 0 slots and AIFS to AIFSN.
+        if (m_mac->GetPedcaSupported() && m_edca->GetAccessCategory() == AC_VO && 
+            m_qsrc >= PEDCA_RETRY_THRESHOLD && m_psrc < PEDCA_CONSECUTIVE_ATTEMPT)
+        {
+             // std::clog << "[P-EDCA OVERRIDE] Forcing Backoff=0 for P-EDCA (Stage 1) retry" << std::endl;
+             
+             Ptr<ChannelAccessManager> cam = m_mac->GetChannelAccessManager(m_linkId);
+             if (cam) 
+             {
+                 Time slot = m_phy->GetSlot();
+                 // Target DS-CTS time = LastBusy + SIFS + AIFSN*Slot + DSr*Slot
+                 // cam->GetAccessGrantStart() returns LastBusy + SIFS
+                 Time accessGrantStart = cam->GetAccessGrantStart(); 
+                 
+                 // Use current AIFSN (should be 2 for VO/P-EDCA)
+                 Time backoffEnd = accessGrantStart + m_edca->GetAifsn(m_linkId) * slot;
+                 
+                 // Force 0 slots (DSr=0 for now)
+                 m_edca->UpdateBackoffSlotsNow(0, backoffEnd, m_linkId);
+             }
+        }
+
         m_edca = nullptr;
     }
     else

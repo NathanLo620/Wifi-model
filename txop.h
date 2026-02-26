@@ -479,6 +479,7 @@ class Txop : public Object
   protected:
     ///< ChannelAccessManager associated class
     friend class ChannelAccessManager;
+    friend class QosFrameExchangeManager;
     friend class ::EmlsrUlTxopTest;
 
     void DoDispose() override;

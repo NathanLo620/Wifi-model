@@ -1236,6 +1236,17 @@ void
 FrameExchangeManager::PsduRxError(Ptr<const WifiPsdu> psdu)
 {
     NS_LOG_FUNCTION(this << psdu);
+    // [TEMP TRACE] Log CTS frames that failed PHY decode (collision)
+    if (psdu && psdu->GetNMpdus() == 1)
+    {
+        const auto& hdr = psdu->GetHeader(0);
+        if (hdr.IsCts() && hdr.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
+        {
+            std::clog << "[DS-CTS PHY-ERROR] STA=" << m_self
+                      << " FAILED to decode DS-CTS at t="
+                      << Simulator::Now().GetMicroSeconds() << "us (collision?)" << std::endl;
+        }
+    }
 }
 
 void
@@ -1255,6 +1266,18 @@ FrameExchangeManager::Receive(Ptr<const WifiPsdu> psdu,
     }
 
     Mac48Address addr1 = psdu->GetAddr1();
+
+    // [TEMP TRACE] Log DS-CTS arriving at Receive() from PHY
+    if (psdu->GetNMpdus() == 1)
+    {
+        const auto& hdr0 = psdu->GetHeader(0);
+        if (hdr0.IsCts() && hdr0.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
+        {
+            std::clog << "[DS-CTS RECV-ENTRY] STA=" << m_self
+                      << " PHY delivered DS-CTS at t="
+                      << Simulator::Now().GetMicroSeconds() << "us" << std::endl;
+        }
+    }
 
     if (addr1.IsGroup() || addr1 == m_self)
     {
@@ -1332,6 +1355,13 @@ FrameExchangeManager::UpdateNav(const WifiMacHeader& hdr,
                      << " Duration=" << duration.GetMicroSeconds() << "us"
                      << " surplus=" << surplus.GetMicroSeconds() << "us"
                      << " m_self=" << m_self);
+        // [TEMP TRACE] Log DS-CTS NAV update
+        if (hdr.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
+        {
+            std::clog << "[DS-CTS NAV-RX] STA=" << m_self
+                      << " received DS-CTS, Duration=" << duration.GetMicroSeconds()
+                      << "us at t=" << Simulator::Now().GetMicroSeconds() << "us" << std::endl;
+        }
     }
     
     duration += surplus;
@@ -1351,6 +1381,14 @@ FrameExchangeManager::UpdateNav(const WifiMacHeader& hdr,
     {
         m_navEnd = navEnd;
         NS_LOG_DEBUG("Updated NAV=" << m_navEnd);
+        // [TEMP TRACE] Confirm NAV was set for DS-CTS
+        if (hdr.IsCts() && hdr.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
+        {
+            std::clog << "[DS-CTS NAV-SET] STA=" << m_self
+                      << " NAV set to " << m_navEnd.GetMicroSeconds()
+                      << "us (duration=" << duration.GetMicroSeconds() << "us)"
+                      << std::endl;
+        }
 
         // A STA that used information from an RTS frame as the most recent basis to update
         // its NAV setting is permitted to reset its NAV if no PHY-RXSTART.indication
