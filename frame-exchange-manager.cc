@@ -1480,6 +1480,7 @@ FrameExchangeManager::ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
             // (IEEE 802.11-2016 sec. 10.3.2.7)
             if (VirtualCsMediumIdle())
             {
+                std::clog << "[RTS-RX] STA=" << m_self << " Received RTS from=" << hdr.GetAddr2() << ", Medium IDLE -> schedule CTS" << std::endl;
                 NS_LOG_DEBUG("Received RTS from=" << hdr.GetAddr2() << ", schedule CTS");
                 m_sendCtsEvent = Simulator::Schedule(m_phy->GetSifs(),
                                                      &FrameExchangeManager::SendCtsAfterRts,
@@ -1490,6 +1491,7 @@ FrameExchangeManager::ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
             }
             else
             {
+                std::clog << "[RTS-RX] STA=" << m_self << " Received RTS from=" << hdr.GetAddr2() << ", Medium BUSY (NAV=" << m_navEnd.GetMicroSeconds() << "us) -> cannot schedule CTS" << std::endl;
                 NS_LOG_DEBUG("Received RTS from=" << hdr.GetAddr2() << ", cannot schedule CTS");
             }
         }

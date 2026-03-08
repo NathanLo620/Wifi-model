@@ -247,9 +247,25 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
             // We only intervene if we are starting a NEW TXOP.
             if (m_mac->GetPedcaSupported() && m_edca->GetAccessCategory() == AC_VO)
             {
-                // P-EDCA Trigger Check (per 802.11be spec):
-                // 1. QSRC[AC_VO] >= dot11PEDCARetryThreshold
-                // 2. PSRC[AC_VO] < dot11PEDCAConsecutiveAttempt
+                // Comment Resolution #4555, #7657, #12651:
+                // dot11ShortRetryLimit must be configured higher than dot11PEDCARetryThreshold.
+                // If not, P-EDCA would be unreachable (MPDU dropped before QSRC hits threshold).
+                // Auto-raise FrameRetryLimit if violated.
+                uint32_t frameRetryLimit = m_mac->GetFrameRetryLimit();
+                if (frameRetryLimit <= PEDCA_RETRY_THRESHOLD)
+                {
+                    uint32_t newLimit = PEDCA_RETRY_THRESHOLD + 1;
+                    std::clog << "[P-EDCA CONFIG] WARNING: dot11ShortRetryLimit ("
+                              << frameRetryLimit << ") <= dot11PEDCARetryThreshold ("
+                              << PEDCA_RETRY_THRESHOLD << "). "
+                              << "Auto-raising FrameRetryLimit to " << newLimit
+                              << " (per CR #4555, #7657, #12651)" << std::endl;
+                    m_mac->SetFrameRetryLimit(newLimit);
+                }
+
+                // P-EDCA Trigger Check (per 802.11be spec, CR #4555, #7657, #12651):
+                // 1. QSRC[AC_VO] is equal to or greater than dot11PEDCARetryThreshold
+                // 2. PSRC[AC_VO] is less than dot11PEDCAConsecutiveAttempt
                 
                 std::clog << "[P-EDCA TRIGGER CHECK] t=" << Simulator::Now().GetMicroSeconds() 
                           << "us QSRC=" << m_qsrc << " PSRC=" << +m_psrc 
@@ -964,17 +980,19 @@ QosFrameExchangeManager::TransmissionSucceeded()
     if (m_mac && m_mac->GetPedcaSupported() && m_edca && m_edca->GetAccessCategory() == AC_VO)
     {
         // Any VO TX success should reset QSRC (per spec: QSRC reset when MPDU delivered)
-        if (m_qsrc > 0 || m_psrc > 0)
+        // Any VO TX success should reset QSRC (per spec: QSRC reset when MPDU delivered)
+        std::clog << "[P-EDCA VO SUCCESS] VO TX succeeded at t="
+                  << Simulator::Now().GetMicroSeconds() << "us"
+                  << " QSRC=" << m_qsrc << " PSRC=" << +m_psrc;
+        if (m_pedcaStage2Active)
         {
-            std::clog << "[P-EDCA VO SUCCESS] VO TX succeeded at t="
-                      << Simulator::Now().GetMicroSeconds() << "us"
-                      << " QSRC=" << m_qsrc << " PSRC=" << +m_psrc;
-            if (m_pedcaStage2Active)
-            {
-                std::clog << " (Stage2)";
-            }
-            std::clog << " -> Resetting counters" << std::endl;
+            std::clog << " (Stage2)";
         }
+        else
+        {
+            std::clog << " (EDCA)";
+        }
+        std::clog << " -> Resetting counters" << std::endl;
         
         // Reset QSRC and PSRC on successful TXOP (per spec)
         m_qsrc = 0;
