@@ -80,6 +80,17 @@ class QosTxop : public Txop
 
 
     /**
+     * @brief Generate backoff for P-EDCA Stage 1 (DS-CTS).
+     *
+     * Extracts a random DSr from [0, cwds] and sets it as the backoff.
+     *
+     * @param cwds the contention window for DS-CTS
+     * @param linkId the ID of the link
+     */
+    void GeneratePedcaStage1Backoff(uint32_t cwds, uint8_t linkId);
+
+
+    /**
      * Get the access category of this object.
      *
      * @return the access category.

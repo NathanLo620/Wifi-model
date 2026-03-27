@@ -17,6 +17,8 @@
 #include "ns3/log.h"
 #include "ns3/wifi-mac.h"
 #include "ns3/qos-utils.h" // Added for P-EDCA logic
+#include "wifi-protection.h"
+#include "wifi-protection-manager.h"
 
 #undef NS_LOG_APPEND_CONTEXT
 #define NS_LOG_APPEND_CONTEXT WIFI_FEM_NS_LOG_APPEND_CONTEXT
@@ -36,6 +38,18 @@ QosFrameExchangeManager::GetTypeId()
             .SetParent<FrameExchangeManager>()
             .AddConstructor<QosFrameExchangeManager>()
             .SetGroupName("Wifi")
+            .AddTraceSource("PedcaTx",
+                            "A P-EDCA Stage 2 transmission",
+                            MakeTraceSourceAccessor(&QosFrameExchangeManager::m_pedcaTxTrace),
+                            "ns3::Packet::TracedCallback")
+            .AddTraceSource("EdcaTx",
+                            "An EDCA transmission",
+                            MakeTraceSourceAccessor(&QosFrameExchangeManager::m_edcaTxTrace),
+                            "ns3::Packet::TracedCallback")
+            .AddTraceSource("PedcaAttempt",
+                            "A P-EDCA Stage 1 attempt (DS-CTS sent)",
+                            MakeTraceSourceAccessor(&QosFrameExchangeManager::m_pedcaAttemptTrace),
+                            "ns3::Packet::TracedCallback")
             .AddAttribute("PifsRecovery",
                           "Perform a PIFS recovery as a response to transmission failure "
                           "within a TXOP",
@@ -266,6 +280,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                 // P-EDCA Trigger Check (per 802.11be spec, CR #4555, #7657, #12651):
                 // 1. QSRC[AC_VO] is equal to or greater than dot11PEDCARetryThreshold
                 // 2. PSRC[AC_VO] is less than dot11PEDCAConsecutiveAttempt
+                // 3. dot11ShortRetryLimit > dot11PEDCARetryThreshold
                 
                 std::clog << "[P-EDCA TRIGGER CHECK] t=" << Simulator::Now().GetMicroSeconds() 
                           << "us QSRC=" << m_qsrc << " PSRC=" << +m_psrc 
@@ -274,6 +289,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                 
                 bool qsrcOk = (m_qsrc >= PEDCA_RETRY_THRESHOLD);
                 bool psrcOk = (m_psrc < PEDCA_CONSECUTIVE_ATTEMPT);
+                bool retryLimitOk = (m_mac->GetFrameRetryLimit() > PEDCA_RETRY_THRESHOLD);
                 
                 // DEFERRAL RULES: Check EIFS (implicit), CTS/Ack Timeout, and NAV
                 bool navActive = !VirtualCsMediumIdle();
@@ -295,26 +311,19 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                      NotifyChannelReleased(m_edca);
                      
                      // P-EDCA TIMING FIX:
-                     // If we defer P-EDCA (e.g. due to busy medium), we should retry ASAP (AIFS + 0).
-                     // Force backoff to 0 slots if P-EDCA conditions are met.
-                     if (qsrcOk && psrcOk)
+                     // If we defer P-EDCA (e.g. due to busy medium), we should retry using Stage 1 backoff.
+                     // Generate DSr (0~CWds) backoff slots if P-EDCA conditions are met.
+                     if (qsrcOk && psrcOk && retryLimitOk)
                      {
-                         // std::clog << "[P-EDCA OVERRIDE] Forcing Backoff=0 for deferred P-EDCA attempt" << std::endl;
-                         Ptr<ChannelAccessManager> cam = m_mac->GetChannelAccessManager(m_linkId);
-                         if (cam) 
-                         {
-                             Time slot = m_phy->GetSlot();
-                             Time accessGrantStart = cam->GetAccessGrantStart(); 
-                             Time backoffEnd = accessGrantStart + m_edca->GetAifsn(m_linkId) * slot;
-                             m_edca->UpdateBackoffSlotsNow(0, backoffEnd, m_linkId);
-                         }
+                         std::clog << "[P-EDCA PRIORITY] Deferred: Generating Stage 1 backoff (CWds=0) for ASAP retry" << std::endl;
+                         m_edca->GeneratePedcaStage1Backoff(0, m_linkId);
                      }
                      
                      m_edca = nullptr;
                      return false;
                 }
 
-                if (!m_pedcaPending && qsrcOk && psrcOk)
+                if (!m_pedcaPending && qsrcOk && psrcOk && retryLimitOk)
                 {
                     // === P-EDCA Stage 1: Send DS-CTS ===
                     // 
@@ -344,11 +353,11 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     Time sifs = m_phy->GetSifs();  // 16µs for 5GHz OFDM
                     Time slotTime = m_phy->GetSlot();  // 9µs for OFDM
                     uint8_t aifsn = 2;  // P-EDCA AIFSN for DS-CTS
-                    uint8_t dsr = 0;    // DSr randomization (currently 0, CWds not implemented)
+                    uint32_t dsr = m_edca->GetBackoffSlots(m_linkId); // Actual DSr that was drawn and waited
                     
                     // Expected time for DS-CTS = accessGrantStart + AIFSN × SlotTime + DSr × SlotTime
                     // But accessGrantStart = lastBusy + SIFS, so effective delay from lastBusy = SIFS + AIFSN × SlotTime
-                    Time expectedDsaifs = sifs + (aifsn + dsr) * slotTime;  // Should be 34µs
+                    Time expectedDsaifs = sifs + (aifsn + dsr) * slotTime;
                     Time lastBusyPlusSifs = accessGrantStart;  // accessGrantStart = lastBusy + SIFS
                     Time expectedDsCtsTime = lastBusyPlusSifs + (aifsn + dsr) * slotTime;
                     
@@ -388,16 +397,11 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     ctsHeader.SetNoRetry();
                     ctsHeader.SetAddr1(Mac48Address("00:0F:AC:47:43:00")); // P-EDCA fixed RA (per draft)
                     
-                    // P-EDCA DS-CTS Duration: 97µs (per P-EDCA standard)
-                    // 
-                    // Duration = SIFS + AIFSN*SlotTime + CWmax*SlotTime
-                    //          = 10µs + 2*9µs + 7*9µs = 10 + 18 + 63 = 91µs ≈ 97µs
-                    //
-                    // During this 97µs window:
-                    //   - Non-P-EDCA STAs are frozen by NAV
-                    //   - P-EDCA+VO STAs contend with P-EDCA parameters (CW=7, AIFSN=2)
-                    //   - Winner transmits its VO data immediately
-                    Time pedcaWindowDuration = MicroSeconds(97);
+                    // P-EDCA DS-CTS Duration: 77µs (per P-EDCA standard/draft resolutions)
+                    // Reserves a 77us contention window:
+                    //   - NAV freezes non-P-EDCA STAs
+                    //   - P-EDCA STAs contend with (CW=7, AIFSN=2) 
+                    Time pedcaWindowDuration = MicroSeconds(77);
                     ctsHeader.SetDuration(pedcaWindowDuration);
 
                     // 3. Transmit DS-CTS using non-HT OFDM 6 Mbps (per P-EDCA draft 3.5)
@@ -414,6 +418,9 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
 
                     
                     ForwardMpduDown(mpdu, ctsTxVector);
+                    
+                    // Fire P-EDCA Attempt trace (DS-CTS sent = one P-EDCA attempt)
+                    m_pedcaAttemptTrace(mpdu->GetPacket());
                     
                     Time ctsAirtime = m_phy->CalculateTxDuration(mpdu->GetPacketSize(),
                                                                 ctsTxVector,
@@ -529,7 +536,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                      Time payloadStart = Simulator::Now();
                      bool stage2Valid = false;
 
-                     // Determine if this is a valid P-EDCA transmission within the 97us window
+                     // Determine if this is a valid P-EDCA transmission within the 77us window
                      if (m_pedcaCtsTxEnd > Seconds(0))
                      {
                          Time gap = payloadStart - m_pedcaCtsTxEnd;
@@ -539,18 +546,18 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                                    << "us, CTS TX end=" << m_pedcaCtsTxEnd.GetMicroSeconds()
                                    << "us, gap=" << gapUs << "us";
 
-                         // 97us is the HARD LIMIT from the 802.11be spec for P-EDCA window
-                         // Expected gap = AIFS + backoff = [34, 97]µs
+                         // 77us is the HARD LIMIT from the 802.11bn draft (resolutions #141, #189)
+                         // Expected gap = AIFS + backoff = [34, 97]µs (Backoff can exceed 77us, but won't be protected)
                          // AIFS = SIFS(16) + AIFSN(2)*Slot(9) = 34µs
-                         // Max backoff = CWmax(7)*Slot(9) = 63µs → total max = 97µs
-                         if (gapUs <= 97.0) {
+                         // Max backoff = CWmax(7)*Slot(9) = 63µs → total max = 97µs (Only first 43us of backoff is protected)
+                         if (gapUs <= 77.0) {
                              std::clog << " ✓ TIMING OK" << std::endl;
                              stage2Valid = true;
                          } else {
-                             // gap > 97µs: P-EDCA NAV reservation expired.
+                             // gap > 77µs: P-EDCA NAV reservation expired.
                              // Medium was likely busy during Stage 2 contention.
                              // Fallback to normal EDCA.
-                             std::clog << " ✗ TIMING EXPIRED (gap=" << gapUs << "us > 97us) - Fallback to EDCA" << std::endl;
+                             std::clog << " ✗ TIMING EXPIRED (gap=" << gapUs << "us > 77us) - Fallback to EDCA" << std::endl;
                              stage2Valid = false;
                          }
                      }
@@ -684,6 +691,15 @@ QosFrameExchangeManager::StartFrameExchange(Ptr<QosTxop> edca,
 
     SendMpduWithProtection(item, txParams);
 
+    if (item->GetPacket())
+    {
+        m_edcaTxTrace(item->GetPacket());
+        if (m_pedcaStage2Active)
+        {
+            m_pedcaTxTrace(item->GetPacket());
+        }
+    }
+
     return true;
 }
 
@@ -715,6 +731,23 @@ QosFrameExchangeManager::TryAddMpdu(Ptr<const WifiMpdu> mpdu,
 
     std::unique_ptr<WifiProtection> protection;
     protection = GetProtectionManager()->TryAddMpdu(mpdu, txParams);
+
+    // Force RTS for P-EDCA Stage 2, if no RTS protection is scheduled
+    if (m_pedcaStage2Active && m_edca && m_edca->GetAccessCategory() == AC_VO)
+    {
+        bool currentHasRts = (txParams.m_protection && txParams.m_protection->method == WifiProtection::RTS_CTS);
+        bool newHasRts = (protection && protection->method == WifiProtection::RTS_CTS);
+        if (!currentHasRts && !newHasRts)
+        {
+            auto p = std::make_unique<WifiRtsCtsProtection>();
+            p->rtsTxVector = GetWifiRemoteStationManager()->GetRtsTxVector(
+                mpdu->GetHeader().GetAddr1(), txParams.m_txVector.GetChannelWidth());
+            p->ctsTxVector = GetWifiRemoteStationManager()->GetCtsTxVector(
+                mpdu->GetHeader().GetAddr1(), p->rtsTxVector.GetMode());
+            protection = std::move(p);
+        }
+    }
+
     bool protectionSwapped = false;
 
     if (protection)
@@ -1099,6 +1132,18 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
         {
             m_pedcaPending = false;
             std::clog << "[P-EDCA RESTORE] Returning to normal EDCA after failure" << std::endl;
+        }
+
+        // P-EDCA Priority Override: If conditions are met, extract Stage 1 backoff (DSr) for immediate retry.
+        bool qsrcOk = (m_qsrc >= PEDCA_RETRY_THRESHOLD);
+        bool psrcOk = (m_psrc < PEDCA_CONSECUTIVE_ATTEMPT);
+        bool retryLimitOk = (m_mac->GetFrameRetryLimit() > PEDCA_RETRY_THRESHOLD);
+
+        if (qsrcOk && psrcOk && retryLimitOk)
+        {
+             std::clog << "[P-EDCA PRIORITY] Conditions met (QSRC=" << m_qsrc 
+                       << "), generating Stage 1 backoff (CWds=0) for immediate retry" << std::endl;
+             m_edca->GeneratePedcaStage1Backoff(0, m_linkId);
         }
     }
 

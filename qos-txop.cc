@@ -229,6 +229,15 @@ QosTxop::SetPedcaBypassBackoff(bool bypass, uint8_t linkId)
 }
 
 void
+QosTxop::GeneratePedcaStage1Backoff(uint32_t cwds, uint8_t linkId)
+{
+    NS_LOG_FUNCTION(this << cwds << +linkId);
+    auto& link = GetLink(linkId);
+    link.backoffSlots = m_rng->GetInteger(0, cwds);
+    NS_LOG_INFO("P-EDCA Stage 1 DSr generated: " << link.backoffSlots << " slots (CWds=" << cwds << ")");
+}
+
+void
 QosTxop::StartMuEdcaTimerNow(uint8_t linkId)
 {
     NS_LOG_FUNCTION(this << +linkId);

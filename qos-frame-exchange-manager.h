@@ -234,6 +234,9 @@ class QosFrameExchangeManager : public FrameExchangeManager
     
     // P-EDCA Stage 2 collision tracking
     bool m_pedcaStage2Active{false};  //!< True when in P-EDCA Stage 2 contention
+    TracedCallback<Ptr<const Packet>> m_pedcaTxTrace;      //!< Trace for P-EDCA Stage 2 transmissions
+    TracedCallback<Ptr<const Packet>> m_edcaTxTrace;       //!< Trace for all EDCA transmissions
+    TracedCallback<Ptr<const Packet>> m_pedcaAttemptTrace;  //!< Trace for P-EDCA Stage 1 attempts (DS-CTS sent)
 };
 
 } // namespace ns3
