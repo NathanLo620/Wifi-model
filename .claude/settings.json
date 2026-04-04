@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tee /tmp/pedca_trace5.log)",
+      "Read(//tmp/**)"
+    ]
+  }
+}

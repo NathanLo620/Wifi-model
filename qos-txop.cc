@@ -229,6 +229,33 @@ QosTxop::SetPedcaBypassBackoff(bool bypass, uint8_t linkId)
 }
 
 void
+QosTxop::SetPedcaSuspended(bool suspended, uint8_t linkId)
+{
+    NS_LOG_FUNCTION(this << suspended << +linkId);
+    auto& link = GetLink(linkId);
+    link.pedcaSuspended = suspended;
+    if (suspended)
+    {
+        // Cancel access if it was requested
+        link.access = NOT_REQUESTED;
+    }
+    else
+    {
+        // Resume access if we have frames to transmit
+        if (HasFramesToTransmit(linkId))
+        {
+            Simulator::ScheduleNow(&QosTxop::RequestAccess, this, linkId);
+        }
+    }
+}
+
+bool
+QosTxop::IsPedcaSuspended(uint8_t linkId) const
+{
+    return GetLink(linkId).pedcaSuspended;
+}
+
+void
 QosTxop::GeneratePedcaStage1Backoff(uint32_t cwds, uint8_t linkId)
 {
     NS_LOG_FUNCTION(this << cwds << +linkId);
@@ -351,6 +378,12 @@ QosTxop::UseExplicitBarAfterMissedBlockAck() const
 bool
 QosTxop::HasFramesToTransmit(uint8_t linkId)
 {
+    if (GetLink(linkId).pedcaSuspended)
+    {
+        NS_LOG_DEBUG(m_ac << " on link " << +linkId << " is suspended due to P-EDCA");
+        return false;
+    }
+
     // remove MSDUs with expired lifetime starting from the head of the queue
     m_queue->WipeAllExpiredMpdus();
     auto hasFramesToTransmit = static_cast<bool>(m_queue->PeekFirstAvailable(linkId));

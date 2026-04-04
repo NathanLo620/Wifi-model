@@ -78,6 +78,25 @@ class QosTxop : public Txop
      */
     void SetPedcaBypassBackoff(bool bypass, uint8_t linkId);
 
+    /**
+     * @brief Set the P-EDCA suspended state.
+     * 
+     * When suspended, the AC cannot contend for the medium. Standard requires
+     * non-VO ACs to remain suspended across consecutive P-EDCA attempts.
+     *
+     * @param suspended true to suspend, false to resume
+     * @param linkId the ID of the link
+     */
+    void SetPedcaSuspended(bool suspended, uint8_t linkId);
+
+    /**
+     * @brief Check if the P-EDCA suspended state is active.
+     * 
+     * @param linkId the ID of the link
+     * @return true if suspended
+     */
+    bool IsPedcaSuspended(uint8_t linkId) const;
+
 
     /**
      * @brief Generate backoff for P-EDCA Stage 1 (DS-CTS).
@@ -448,6 +467,7 @@ class QosTxop : public Txop
         
         // P-EDCA support
         bool pedcaBypassBackoff{false}; //!< skip backoff generation in P-EDCA Stage 2
+        bool pedcaSuspended{false};     //!< AC is suspended due to P-EDCA
     };
 
     void DoDispose() override;

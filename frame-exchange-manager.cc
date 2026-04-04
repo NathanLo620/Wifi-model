@@ -839,6 +839,13 @@ FrameExchangeManager::SendRts(const WifiTxParameters& txParams)
     m_sentRtsTo = {receiver};
 
     ForwardMpduDown(mpdu, rtsCtsProtection->rtsTxVector);
+
+    // P-EDCA TRACE: Log RTS send time
+    std::clog << "[RTS SENT] STA=" << m_self
+              << " to=" << receiver
+              << " at t=" << Simulator::Now().GetMicroSeconds() << "us"
+              << " dur=" << rts.GetDuration().GetMicroSeconds() << "us"
+              << std::endl;
 }
 
 void
@@ -872,6 +879,13 @@ FrameExchangeManager::DoSendCtsAfterRts(const WifiMacHeader& rtsHdr,
 
     // CTS should always use non-HT PPDU (HT PPDU cases not supported yet)
     ForwardMpduDown(Create<WifiMpdu>(packet, cts), ctsTxVector);
+
+    // P-EDCA TRACE: Log AP CTS reply
+    std::clog << "[CTS SENT] AP/STA=" << m_self
+              << " to=" << rtsHdr.GetAddr2()
+              << " at t=" << Simulator::Now().GetMicroSeconds() << "us"
+              << " dur=" << cts.GetDuration().GetMicroSeconds() << "us"
+              << std::endl;
 }
 
 void
@@ -1093,6 +1107,12 @@ void
 FrameExchangeManager::CtsTimeout(Ptr<WifiMpdu> rts, const WifiTxVector& txVector)
 {
     NS_LOG_FUNCTION(this << *rts << txVector);
+
+    // P-EDCA TRACE: Log CTS timeout
+    std::clog << "[CTS TIMEOUT] STA=" << m_self
+              << " at t=" << Simulator::Now().GetMicroSeconds() << "us"
+              << " (no CTS received after RTS)"
+              << std::endl;
 
     DoCtsTimeout(WifiPsduMap{{SU_STA_ID, Create<WifiPsdu>(m_mpdu, true)}});
     m_mpdu = nullptr;

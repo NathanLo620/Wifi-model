@@ -36,6 +36,17 @@ class QosFrameExchangeManager : public FrameExchangeManager
 
     bool StartTransmission(Ptr<Txop> edca, MHz_u allowedWidth) override;
 
+    // P-EDCA Detailed Trace Getters
+    uint32_t GetDsCtsCount() const { return m_dsCtsCount; }
+    uint32_t GetStage2EntryCount() const { return m_stage2EntryCount; }
+    uint32_t GetStage2TxStartCount() const { return m_stage2TxStartCount; }
+    uint32_t GetPedcaSuccessCount() const { return m_pedcaSuccessCount; }
+    uint32_t GetEdcaVoSuccessCount() const { return m_edcaVoSuccessCount; }
+    uint32_t GetPedcaFailRtsCtsTimeout() const { return m_pedcaFailRtsCtsTimeout; }
+    uint32_t GetPedcaFailRtsCollision() const { return m_pedcaFailRtsCollision; }
+    uint32_t GetPedcaFailTimingExpired() const { return m_pedcaFailTimingExpired; }
+    uint32_t GetPedcaFailDeferral() const { return m_pedcaFailDeferral; }
+
     /**
      * Recompute the protection and acknowledgment methods to use if the given MPDU
      * is added to the frame being built (as described by the given TX parameters)
@@ -172,6 +183,9 @@ class QosFrameExchangeManager : public FrameExchangeManager
      */
     virtual bool SendCfEndIfNeeded();
 
+    void SetWifiPhy(Ptr<WifiPhy> phy) override;
+    void ResetPhy() override;
+
     /**
      * Determine the holder of the TXOP, if possible, based on the received frame
      *
@@ -208,6 +222,11 @@ class QosFrameExchangeManager : public FrameExchangeManager
     void SetTxopHolder(const WifiMacHeader& hdr, const WifiTxVector& txVector);
 
     /**
+     * @brief Resume standard EDCA access for AC_BE, AC_BK, AC_VI.
+     */
+    void ResumePedcaSuspendedACs();
+
+    /**
      * Cancel the PIFS recovery event and have the EDCAF attempting PIFS recovery
      * release the channel.
      */
@@ -231,12 +250,42 @@ class QosFrameExchangeManager : public FrameExchangeManager
     
     // P-EDCA timing tracking for verification
     Time m_pedcaCtsTxEnd{0};  //!< DS-CTS transmission end time for timing verification
-    
+
+    // P-EDCA PhyTxEnd trace helpers (zero-delay Stage 2 entry)
+    bool m_pedcaTxEndPending{false};  //!< True while PhyTxEnd is connected waiting for our DS-CTS
+    Ptr<QosTxop> m_pedcaEdca;         //!< Saved AC_VO Txop for use inside PedcaPhyTxEndCallback
+
+    /**
+     * PhyTxEnd trace callback: fires at the exact moment our DS-CTS finishes TX.
+     * Replaces the polling-loop scheduler so Stage 2 entry has zero delay after CTS TX end.
+     */
+    void PedcaPhyTxEndCallback(Ptr<const Packet> pkt);
+
+    /**
+     * Deferred Stage 2 entry scheduled by PedcaPhyTxEndCallback via ScheduleNow so that
+     * the call runs after WifiPhy::TxDone returns (avoids re-entrant MAC/PHY calls).
+     */
+    void PedcaStage2Enter();
+
     // P-EDCA Stage 2 collision tracking
     bool m_pedcaStage2Active{false};  //!< True when in P-EDCA Stage 2 contention
     TracedCallback<Ptr<const Packet>> m_pedcaTxTrace;      //!< Trace for P-EDCA Stage 2 transmissions
     TracedCallback<Ptr<const Packet>> m_edcaTxTrace;       //!< Trace for all EDCA transmissions
     TracedCallback<Ptr<const Packet>> m_pedcaAttemptTrace;  //!< Trace for P-EDCA Stage 1 attempts (DS-CTS sent)
+
+    // ── P-EDCA Detailed Trace Counters ──
+    // Failure reason counters
+    uint32_t m_pedcaFailRtsCtsTimeout{0};   //!< RTS sent during Stage 2 but AP didn't reply CTS
+    uint32_t m_pedcaFailRtsCollision{0};    //!< RTS collision during Stage 2 (two P-EDCA STAs)
+    uint32_t m_pedcaFailTimingExpired{0};   //!< P-EDCA 77us window expired (legacy steal / slow backoff)
+    uint32_t m_pedcaFailDeferral{0};        //!< P-EDCA deferred (medium busy before DS-CTS)
+    // Event counters
+    uint32_t m_dsCtsCount{0};              //!< Number of DS-CTS frames sent
+    uint32_t m_stage2EntryCount{0};        //!< Number of times Stage 2 contention entered
+    uint32_t m_stage2TxStartCount{0};      //!< Number of times Stage 2 data TX started
+    // Success counters
+    uint32_t m_pedcaSuccessCount{0};       //!< P-EDCA Stage 2 TX succeeded (ACK received)
+    uint32_t m_edcaVoSuccessCount{0};      //!< Normal EDCA VO TX succeeded
 };
 
 } // namespace ns3
