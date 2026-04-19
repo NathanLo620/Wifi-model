@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(tee /tmp/pedca_trace5.log)",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('/home/wmnlab/Desktop/ns-3.45/scratch/delay_pdf/pdf_plot.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
