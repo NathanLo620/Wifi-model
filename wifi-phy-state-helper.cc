@@ -491,6 +491,22 @@ WifiPhyStateHelper::SwitchFromRxEndError(const WifiTxVector& txVector)
 }
 
 void
+WifiPhyStateHelper::NotifyPreambleDetectFailure(const WifiTxVector& txVector)
+{
+    NS_LOG_FUNCTION(this);
+    // PHY never entered RX state, so no state transition needed.
+    // Just notify listeners so CAM applies EIFS instead of AIFS.
+    NotifyListeners(&WifiPhyListener::NotifyPreambleDetectFailure, txVector);
+}
+
+void
+WifiPhyStateHelper::NotifyNavStart(Time duration)
+{
+    NS_LOG_FUNCTION(this << duration);
+    NotifyListeners(&WifiPhyListener::NotifyNavStart, duration);
+}
+
+void
 WifiPhyStateHelper::DoSwitchFromRx()
 {
     NS_LOG_FUNCTION(this);

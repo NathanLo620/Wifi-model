@@ -281,6 +281,13 @@ class ChannelAccessManager : public Object
      */
     void NotifyRxEndErrorNow(const WifiTxVector& txVector);
     /**
+     * @param txVector the TXVECTOR of the frame whose preamble was not decodable.
+     *
+     * Called when the PHY detected energy on the channel but failed preamble detection
+     * (PREAMBLE_DETECT_FAILURE). Forces EIFS deferral for the next channel access.
+     */
+    void NotifyPreambleDetectFailureNow(const WifiTxVector& txVector);
+    /**
      * @param duration expected duration of transmission
      *
      * Notify the Txop that a packet transmission was

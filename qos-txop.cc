@@ -33,6 +33,8 @@
 #include "ns3/random-variable-stream.h"
 #include "ns3/simulator.h"
 
+#include <iostream>
+
 #undef NS_LOG_APPEND_CONTEXT
 #define NS_LOG_APPEND_CONTEXT WIFI_TXOP_NS_LOG_APPEND_CONTEXT
 
@@ -692,13 +694,31 @@ QosTxop::NotifyChannelReleased(uint8_t linkId)
     {
         // Clear the flag
         link.pedcaBypassBackoff = false;
-        
+
         // Generate a random P-EDCA backoff (0-7 slots)
         GenerateBackoff(linkId);
         uint32_t backoffSlots = GetBackoffSlots(linkId);
-        
-        NS_LOG_INFO("P-EDCA Stage2: Backoff=" << backoffSlots 
+
+        NS_LOG_INFO("P-EDCA Stage2: Backoff=" << backoffSlots
                      << " slots, CW=" << GetCw(linkId) << ", AIFSN=" << +GetAifsn(linkId));
+
+        // P-EDCA TRACE: always print Stage 2 initial backoff for diagnostics.
+        // AIFS = SIFS(16us) + AIFSN*Slot(9us). Expected RTS TX time = now + AIFS + backoff*Slot
+        // (assuming the medium stays idle through AIFS+backoff, which is the usual case).
+        Time now = Simulator::Now();
+        uint32_t aifsn = +GetAifsn(linkId);
+        // Slot=9us, SIFS=16us for OFDM 5GHz
+        double slotUs = 9.0;
+        double sifsUs = 16.0;
+        double aifsUs = sifsUs + aifsn * slotUs;
+        double expectedRtsUs = now.GetMicroSeconds() + aifsUs + backoffSlots * slotUs;
+        std::clog << "[P-EDCA STAGE2 BACKOFF] t=" << now.GetMicroSeconds()
+                  << "us  initialBackoff=" << backoffSlots
+                  << "  CW=" << GetCw(linkId)
+                  << "  AIFSN=" << aifsn
+                  << "  expectedRtsTxAt=" << expectedRtsUs << "us"
+                  << "  (gap-from-CTS-end ~ " << (aifsUs + backoffSlots * slotUs) << "us)"
+                  << std::endl;
         
         // Reset state
         link.startTxop.reset();

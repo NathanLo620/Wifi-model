@@ -251,6 +251,19 @@ class WifiPhyStateHelper : public Object
      */
     void SwitchFromRxEndError(const WifiTxVector& txVector);
     /**
+     * Notify listeners that preamble detection failed (energy detected but not decodable).
+     * This triggers EIFS deferral in ChannelAccessManager without a full RX state transition.
+     *
+     * @param txVector the TXVECTOR of the dropped frame
+     */
+    void NotifyPreambleDetectFailure(const WifiTxVector& txVector);
+    /**
+     * Notify listeners that a conservative NAV duration should be applied.
+     *
+     * @param duration the NAV duration
+     */
+    void NotifyNavStart(Time duration);
+    /**
      * Abort current reception following a CCA reset request.
      * @param operatingWidth the channel width the PHY is operating on
      */

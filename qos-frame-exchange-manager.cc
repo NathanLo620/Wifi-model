@@ -533,22 +533,29 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                                    << "us, CTS TX end=" << m_pedcaCtsTxEnd.GetMicroSeconds()
                                    << "us, gap=" << gapUs << "us";
 
-                         // NAV window = 77µs (802.11bn draft).  Gap from ctsTxEnd:
-                         //   AIFS(34µs) + backoff(0–63µs) = [34, 97]µs.
-                         //   Backoff 0–4 → gap 34–70µs ≤ 77µs → protected (TIMING OK, 5/8 probability).
-                         //   Backoff 5–7 → gap 79–97µs > 77µs → TIMING EXPIRED (3/8 probability).
-                         if (gapUs <= 77.0) {
+                         constexpr double PEDCA_NAV_WINDOW_US = 77.0;
+                         constexpr double PEDCA_STAGE2_DEADLINE_US = 200.0;
+
+                         // NAV window = 77µs (802.11bn draft).  Stage 2 itself should still
+                         // start shortly after DS-CTS; if normal EDCA/NAV/CCA activity delays
+                         // it past the implementation deadline, the pending Stage 2 attempt is
+                         // stale and must not be transmitted as a P-EDCA RTS.
+                         if (gapUs <= PEDCA_NAV_WINDOW_US) {
                              std::clog << " ✓ TIMING OK" << std::endl;
                               m_stage2TxStartCount++;  // TRACE: Stage 2 valid TX
                              stage2Valid = true;
+                         } else if (gapUs <= PEDCA_STAGE2_DEADLINE_US) {
+                             std::clog << " ⚠ NAV WINDOW EXPIRED (gap=" << gapUs
+                                       << "us > 77us) - within Stage 2 deadline, continuing"
+                                       << std::endl;
+                             m_stage2TxStartCount++;
+                             stage2Valid = true;
                          } else {
-                             // gap > 77µs: P-EDCA NAV reservation expired at AP/others.
-                             // But the STA itself still continues and finishes its Stage 2 backoff.
-                             // It is still a P-EDCA transmission, just unprotected by DS-CTS NAV.
-                             std::clog << " ⚠ TIMING EXPIRED (gap=" << gapUs << "us > 77us) - NAV expired, but continuing Stage 2" << std::endl;
-                              m_pedcaFailTimingExpired++;  // TRACE: timing expired
-                              m_stage2TxStartCount++;      // TRACE: Still counts as Stage 2 TX start
-                             stage2Valid = true;          // DO NOT fallback to EDCA
+                             std::clog << " ✗ STALE STAGE2 (gap=" << gapUs
+                                       << "us > " << PEDCA_STAGE2_DEADLINE_US
+                                       << "us) - aborting P-EDCA Stage 2" << std::endl;
+                             m_pedcaFailTimingExpired++;
+                             stage2Valid = false;
                          }
                      }
                      else
@@ -580,9 +587,11 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                      }
                      else
                      {
-                         // Fallback to normal EDCA: Active flag false
                          m_pedcaStage2Active = false;
-                         // Continue logic below (will just be a normal EDCA StartFrameExchange)
+                         ResumePedcaSuspendedACs();
+                         NotifyChannelReleased(m_edca);
+                         m_edca = nullptr;
+                         return false;
                      }
                 }
                 // else: conditions not met (QSRC < threshold or PSRC >= limit) - proceed with normal EDCA

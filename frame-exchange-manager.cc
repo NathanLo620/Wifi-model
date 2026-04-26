@@ -1409,6 +1409,16 @@ FrameExchangeManager::UpdateNav(const WifiMacHeader& hdr,
                       << "us (duration=" << duration.GetMicroSeconds() << "us)"
                       << std::endl;
         }
+        // [TEMP TRACE] Confirm NAV was set by an RTS (so we can tell which STA
+        // captured an RTS instead of DS-CTS during a 4-way collision)
+        else if (hdr.IsRts())
+        {
+            std::clog << "[RTS NAV-SET] STA=" << m_self
+                      << " NAV set to " << m_navEnd.GetMicroSeconds()
+                      << "us (RTS from=" << hdr.GetAddr2()
+                      << ", duration=" << duration.GetMicroSeconds() << "us)"
+                      << std::endl;
+        }
 
         // A STA that used information from an RTS frame as the most recent basis to update
         // its NAV setting is permitted to reset its NAV if no PHY-RXSTART.indication
@@ -1472,7 +1482,9 @@ FrameExchangeManager::ResetTxNav()
 bool
 FrameExchangeManager::VirtualCsMediumIdle() const
 {
-    return m_navEnd <= Simulator::Now();
+    const auto now = Simulator::Now();
+    return m_navEnd <= now &&
+           (!m_channelAccessManager || m_channelAccessManager->GetNavEnd() <= now);
 }
 
 void
@@ -1500,7 +1512,10 @@ FrameExchangeManager::ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
             // (IEEE 802.11-2016 sec. 10.3.2.7)
             if (VirtualCsMediumIdle())
             {
-                std::clog << "[RTS-RX] STA=" << m_self << " Received RTS from=" << hdr.GetAddr2() << ", Medium IDLE -> schedule CTS" << std::endl;
+                std::clog << "[RTS-RX] t=" << Simulator::Now().GetMicroSeconds()
+                          << "us STA=" << m_self << " from=" << hdr.GetAddr2()
+                          << ", VirtualCS IDLE (NAV=" << m_navEnd.GetMicroSeconds()
+                          << "us) -> will send CTS after SIFS" << std::endl;
                 NS_LOG_DEBUG("Received RTS from=" << hdr.GetAddr2() << ", schedule CTS");
                 m_sendCtsEvent = Simulator::Schedule(m_phy->GetSifs(),
                                                      &FrameExchangeManager::SendCtsAfterRts,
@@ -1511,7 +1526,11 @@ FrameExchangeManager::ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
             }
             else
             {
-                std::clog << "[RTS-RX] STA=" << m_self << " Received RTS from=" << hdr.GetAddr2() << ", Medium BUSY (NAV=" << m_navEnd.GetMicroSeconds() << "us) -> cannot schedule CTS" << std::endl;
+                std::clog << "[RTS-RX] t=" << Simulator::Now().GetMicroSeconds()
+                          << "us STA=" << m_self << " from=" << hdr.GetAddr2()
+                          << ", VirtualCS BUSY (NAV=" << m_navEnd.GetMicroSeconds()
+                          << "us, NAV-remaining=" << (m_navEnd - Simulator::Now()).GetMicroSeconds()
+                          << "us) -> CANNOT send CTS" << std::endl;
                 NS_LOG_DEBUG("Received RTS from=" << hdr.GetAddr2() << ", cannot schedule CTS");
             }
         }
