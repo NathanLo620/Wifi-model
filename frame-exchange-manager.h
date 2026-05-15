@@ -535,6 +535,7 @@ class FrameExchangeManager : public Object
     Mac48Address m_self;                              //!< the MAC address of this device
     Mac48Address m_bssid;                             //!< BSSID address (Mac48Address)
     Time m_navEnd;                                    //!< NAV expiration time
+    Time m_navEndFromDsCts{0};                        //!< NAV expiration time set by P-EDCA DS-CTS (suppresses ACK during this window)
     Time m_txNav;                                     //!< the TXNAV timer
     std::set<Mac48Address> m_sentRtsTo; //!< the STA(s) which we sent an RTS to (waiting for CTS)
     std::set<Mac48Address>

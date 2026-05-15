@@ -948,6 +948,19 @@ FrameExchangeManager::SendNormalAck(const WifiMacHeader& hdr,
 {
     NS_LOG_FUNCTION(this << hdr << dataTxVector << dataSnr);
 
+    // P-EDCA: suppress ACK if DS-CTS NAV is currently active. This stops the
+    // AP (or any STA) from TXing a SIFS-bounded ACK during the 77us P-EDCA
+    // contention window, which would otherwise pause stage-2 backoffs.
+    if (m_navEndFromDsCts > Simulator::Now())
+    {
+        std::clog << "[DS-CTS ACK-SUPPRESS] STA=" << m_self
+                  << " skipping ACK to " << hdr.GetAddr2()
+                  << " (DS-CTS NAV active until "
+                  << m_navEndFromDsCts.GetMicroSeconds() << "us, now="
+                  << Simulator::Now().GetMicroSeconds() << "us)" << std::endl;
+        return;
+    }
+
     WifiTxVector ackTxVector =
         GetWifiRemoteStationManager()->GetAckTxVector(hdr.GetAddr2(), dataTxVector);
     WifiMacHeader ack;
@@ -1404,6 +1417,9 @@ FrameExchangeManager::UpdateNav(const WifiMacHeader& hdr,
         // [TEMP TRACE] Confirm NAV was set for DS-CTS
         if (hdr.IsCts() && hdr.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
         {
+            // Mark NAV as set by DS-CTS so we can suppress SIFS-bounded ACKs that
+            // would otherwise fire during the P-EDCA contention window.
+            m_navEndFromDsCts = navEnd;
             std::clog << "[DS-CTS NAV-SET] STA=" << m_self
                       << " NAV set to " << m_navEnd.GetMicroSeconds()
                       << "us (duration=" << duration.GetMicroSeconds() << "us)"
@@ -1510,7 +1526,12 @@ FrameExchangeManager::ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
             // - If the NAV indicates idle, the STA shall respond with a CTS frame after a SIFS
             // - Otherwise, the STA shall not respond with a CTS frame
             // (IEEE 802.11-2016 sec. 10.3.2.7)
-            if (VirtualCsMediumIdle())
+            //
+            // P-EDCA exception: if NAV was set by a DS-CTS, this RTS is from the
+            // P-EDCA stage-2 winner and the receiver (AP) must reply CTS so the
+            // exchange can complete inside the protected window.
+            const bool dsCtsNavExempt = (m_navEndFromDsCts > Simulator::Now());
+            if (VirtualCsMediumIdle() || dsCtsNavExempt)
             {
                 std::clog << "[RTS-RX] t=" << Simulator::Now().GetMicroSeconds()
                           << "us STA=" << m_self << " from=" << hdr.GetAddr2()

@@ -12,6 +12,8 @@
 #include "frame-exchange-manager.h"
 
 #include <optional>
+#include <vector>
+#include <string>
 
 namespace ns3
 {
@@ -46,6 +48,16 @@ class QosFrameExchangeManager : public FrameExchangeManager
     uint32_t GetPedcaFailRtsCollision() const { return m_pedcaFailRtsCollision; }
     uint32_t GetPedcaFailTimingExpired() const { return m_pedcaFailTimingExpired; }
     uint32_t GetPedcaFailDeferral() const { return m_pedcaFailDeferral; }
+
+    // Per-attempt P-EDCA record for backoff vs failure analysis
+    struct PedcaAttemptRecord
+    {
+        double dsCtsEndUs;       //!< Time when DS-CTS TX ended (microseconds)
+        double gapUs;            //!< Effective gap from DS-CTS end to TX start (microseconds)
+        int    backoffSlots;     //!< Reconstructed backoff slots = (gap-AIFS)/slotTime; -1 if unknown
+        std::string outcome;     //!< SUCCESS / RTS_CTS_TIMEOUT / RTS_COLLISION / TIMING_EXPIRED / DEFERRAL
+    };
+    const std::vector<PedcaAttemptRecord>& GetPedcaAttempts() const { return m_pedcaAttempts; }
 
     /**
      * Recompute the protection and acknowledgment methods to use if the given MPDU
@@ -286,6 +298,11 @@ class QosFrameExchangeManager : public FrameExchangeManager
     // Success counters
     uint32_t m_pedcaSuccessCount{0};       //!< P-EDCA Stage 2 TX succeeded (ACK received)
     uint32_t m_edcaVoSuccessCount{0};      //!< Normal EDCA VO TX succeeded
+
+    // Per-attempt log: gap and outcome of each P-EDCA Stage 2 attempt
+    std::vector<PedcaAttemptRecord> m_pedcaAttempts;
+    double m_lastStage2GapUs{-1.0};   //!< Most recent Stage 2 gap (used to back-fill outcome)
+    int    m_lastBackoffSlots{-1};    //!< Reconstructed backoff slots for the in-flight attempt
 };
 
 } // namespace ns3

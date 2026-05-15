@@ -330,6 +330,8 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                 if (!m_pedcaPending && deferralRequired)
                 {
                      m_pedcaFailDeferral++;  // TRACE: deferral count
+                     m_pedcaAttempts.push_back({static_cast<double>(Simulator::Now().GetMicroSeconds()),
+                                                0.0, -1, "DEFERRAL"});
                      std::clog << "[P-EDCA DEFERRAL] Condition met at t=" << Simulator::Now().GetMicroSeconds() << "us: "
                                << (waitingForResponse ? "WaitingForResponse " : "")
                                << (navActive ? "NAV>0 " : "")
@@ -431,7 +433,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     // Reserves a 77us contention window:
                     //   - NAV freezes non-P-EDCA STAs
                     //   - P-EDCA STAs contend with (CW=7, AIFSN=2) 
-                    Time pedcaWindowDuration = MicroSeconds(77);
+                    Time pedcaWindowDuration = MicroSeconds(79);
                     ctsHeader.SetDuration(pedcaWindowDuration);
 
                     // 3. Transmit DS-CTS using non-HT OFDM 6 Mbps (per P-EDCA draft 3.5)
@@ -533,8 +535,16 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                                    << "us, CTS TX end=" << m_pedcaCtsTxEnd.GetMicroSeconds()
                                    << "us, gap=" << gapUs << "us";
 
-                         constexpr double PEDCA_NAV_WINDOW_US = 77.0;
+                         constexpr double PEDCA_NAV_WINDOW_US = 79.0;
                          constexpr double PEDCA_STAGE2_DEADLINE_US = 200.0;
+
+                         // Capture per-attempt info (AIFS=34us, slot=9us assumed for OFDM 5GHz)
+                         constexpr double AIFS_US = 34.0;
+                         constexpr double SLOT_US = 9.0;
+                         m_lastStage2GapUs = gapUs;
+                         m_lastBackoffSlots = (gapUs >= AIFS_US)
+                             ? static_cast<int>((gapUs - AIFS_US) / SLOT_US + 0.5)
+                             : -1;
 
                          // NAV window = 77µs (802.11bn draft).  Stage 2 itself should still
                          // start shortly after DS-CTS; if normal EDCA/NAV/CCA activity delays
@@ -555,6 +565,11 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                                        << "us > " << PEDCA_STAGE2_DEADLINE_US
                                        << "us) - aborting P-EDCA Stage 2" << std::endl;
                              m_pedcaFailTimingExpired++;
+                             m_pedcaAttempts.push_back({m_pedcaCtsTxEnd.GetMicroSeconds(),
+                                                       gapUs, m_lastBackoffSlots,
+                                                       "TIMING_EXPIRED"});
+                             m_lastStage2GapUs = -1.0;
+                             m_lastBackoffSlots = -1;
                              stage2Valid = false;
                          }
                      }
@@ -1017,6 +1032,12 @@ QosFrameExchangeManager::TransmissionSucceeded()
         if (m_pedcaStage2Active)
         {
             m_pedcaSuccessCount++;  // TRACE: P-EDCA success
+            if (m_lastStage2GapUs >= 0.0) {
+                m_pedcaAttempts.push_back({Simulator::Now().GetMicroSeconds() - m_lastStage2GapUs,
+                                           m_lastStage2GapUs, m_lastBackoffSlots, "SUCCESS"});
+                m_lastStage2GapUs = -1.0;
+                m_lastBackoffSlots = -1;
+            }
             std::clog << " (Stage2-PEDCA)";
         }
         else
@@ -1087,6 +1108,13 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
         if (forceCurrentCw)
         {
             m_pedcaFailRtsCtsTimeout++;  // TRACE: CTS timeout (AP didn't reply to RTS)
+            if (m_lastStage2GapUs >= 0.0) {
+                m_pedcaAttempts.push_back({Simulator::Now().GetMicroSeconds() - m_lastStage2GapUs,
+                                           m_lastStage2GapUs, m_lastBackoffSlots,
+                                           "RTS_CTS_TIMEOUT"});
+                m_lastStage2GapUs = -1.0;
+                m_lastBackoffSlots = -1;
+            }
             std::clog << "[P-EDCA STAGE2 FAIL:CTS_TIMEOUT] TX failed during Stage 2 at t="
                       << Simulator::Now().GetMicroSeconds() << "us"
                       << " PSRC=" << +m_psrc << " QSRC=" << m_qsrc << std::endl;
@@ -1094,6 +1122,13 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
         else
         {
             m_pedcaFailRtsCollision++;  // TRACE: RTS/data collision in Stage 2
+            if (m_lastStage2GapUs >= 0.0) {
+                m_pedcaAttempts.push_back({Simulator::Now().GetMicroSeconds() - m_lastStage2GapUs,
+                                           m_lastStage2GapUs, m_lastBackoffSlots,
+                                           "RTS_COLLISION"});
+                m_lastStage2GapUs = -1.0;
+                m_lastBackoffSlots = -1;
+            }
             std::clog << "[P-EDCA STAGE2 FAIL:COLLISION] TX failed during Stage 2 at t="
                       << Simulator::Now().GetMicroSeconds() << "us"
                       << " PSRC=" << +m_psrc << " QSRC=" << m_qsrc << std::endl;
@@ -1426,7 +1461,10 @@ QosFrameExchangeManager::ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
         // frame matches the saved TXOP holder address, then the STA shall send the
         // CTS frame after SIFS, without regard for, and without resetting, its NAV.
         // (sec. 10.22.2.4 of 802.11-2016)
-        if (hdr.GetAddr2() == m_txopHolder || VirtualCsMediumIdle())
+        // P-EDCA exception: if NAV was set by a DS-CTS, this RTS is from the
+        // P-EDCA stage-2 winner; reply CTS so the protected exchange can complete.
+        const bool dsCtsNavExempt = (m_navEndFromDsCts > Simulator::Now());
+        if (hdr.GetAddr2() == m_txopHolder || VirtualCsMediumIdle() || dsCtsNavExempt)
         {
             NS_LOG_DEBUG("Received RTS from=" << hdr.GetAddr2() << ", schedule CTS");
             m_sendCtsEvent = Simulator::Schedule(m_phy->GetSifs(),
