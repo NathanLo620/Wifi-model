@@ -49,6 +49,9 @@ class QosFrameExchangeManager : public FrameExchangeManager
     uint32_t GetPedcaFailTimingExpired() const { return m_pedcaFailTimingExpired; }
     uint32_t GetPedcaFailDeferral() const { return m_pedcaFailDeferral; }
 
+    /** Set the P-EDCA Stage-1 contention window (CWds).  Must be called before simulation start. */
+    void SetCwds(uint32_t cwds) { m_cwds = cwds; }
+
     // Per-attempt P-EDCA record for backoff vs failure analysis
     struct PedcaAttemptRecord
     {
@@ -255,7 +258,8 @@ class QosFrameExchangeManager : public FrameExchangeManager
     // P-EDCA PSRC/QSRC counters (per 802.11be spec)
     uint8_t m_psrc{0};                       //!< P-EDCA STA Retry Counter (consecutive DS-CTS attempts)
     uint16_t m_qsrc{0};                      //!< Queue Size Retry Counter (tracks VO retry conditions)
-    
+    uint32_t m_cwds{0};                      //!< CWds: Stage-1 contention window (0 = ASAP, 1+ = random backoff)
+
     // P-EDCA thresholds (configurable, per 802.11be draft spec)
     static constexpr uint16_t PEDCA_RETRY_THRESHOLD = 2;       //!< dot11PEDCARetryThreshold (default=2)
     static constexpr uint8_t PEDCA_CONSECUTIVE_ATTEMPT = 1;    //!< dot11PEDCAConsecutiveAttempt (draft D1.1 default=1)
