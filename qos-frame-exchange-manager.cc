@@ -289,12 +289,12 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                 // If not, P-EDCA would be unreachable (MPDU dropped before QSRC hits threshold).
                 // Auto-raise FrameRetryLimit if violated.
                 uint32_t frameRetryLimit = m_mac->GetFrameRetryLimit();
-                if (frameRetryLimit <= PEDCA_RETRY_THRESHOLD)
+                if (frameRetryLimit <= m_qsrc_threshold)
                 {
-                    uint32_t newLimit = PEDCA_RETRY_THRESHOLD + 1;
+                    uint32_t newLimit = m_qsrc_threshold + 1;
                     std::clog << "[P-EDCA CONFIG] WARNING: dot11ShortRetryLimit ("
                               << frameRetryLimit << ") <= dot11PEDCARetryThreshold ("
-                              << PEDCA_RETRY_THRESHOLD << "). "
+                              << m_qsrc_threshold << "). "
                               << "Auto-raising FrameRetryLimit to " << newLimit
                               << " (per CR #4555, #7657, #12651)" << std::endl;
                     m_mac->SetFrameRetryLimit(newLimit);
@@ -314,9 +314,9 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                           << " m_pedcaPending=" << (m_pedcaPending ? "TRUE" : "FALSE")
                           << std::endl;
 
-                bool qsrcOk = (m_qsrc >= PEDCA_RETRY_THRESHOLD);
-                bool psrcOk = (m_psrc < PEDCA_CONSECUTIVE_ATTEMPT);
-                bool retryLimitOk = (m_mac->GetFrameRetryLimit() > PEDCA_RETRY_THRESHOLD);
+                bool qsrcOk = (m_qsrc >= m_qsrc_threshold);
+                bool psrcOk = (m_psrc < m_psrc_limit);
+                bool retryLimitOk = (m_mac->GetFrameRetryLimit() > m_qsrc_threshold);
                 // CIDs 7112/11411/11759: AIFSN[AC_VO] must be nonzero for P-EDCA slot boundary to be defined
                 bool aifsn_nonzero = (m_edca->GetAifsn(m_linkId) > 0);
                 
@@ -1153,14 +1153,14 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
         std::clog << "[P-EDCA QSRC++] QSRC incremented to " << m_qsrc << " after Stage 2 collision" << std::endl;
         
         // Check if PSRC exhausted (reached dot11PEDCAConsecutiveAttempt)
-        if (m_psrc >= PEDCA_CONSECUTIVE_ATTEMPT)
+        if (m_psrc >= m_psrc_limit)
         {
             // Per 802.11bn D1.3 §5.4: when PSRC reaches dot11PEDCAConsecutiveAttempt, the STA
             // shall NOT attempt P-EDCA again until QSRC[AC_VO] is reset (i.e., successful TX).
-            // FIX: Do NOT reset PSRC to 0 here. Keeping PSRC >= PEDCA_CONSECUTIVE_ATTEMPT makes
+            // FIX: Do NOT reset PSRC to 0 here. Keeping PSRC >= m_psrc_limit makes
             // psrcOk=false in the trigger check, blocking P-EDCA re-entry.
             // PSRC is only reset to 0 in TransmissionSucceeded() when QSRC is also reset.
-            std::clog << "[P-EDCA PSRC EXHAUSTED] PSRC=" << +m_psrc << " >= " << +PEDCA_CONSECUTIVE_ATTEMPT
+            std::clog << "[P-EDCA PSRC EXHAUSTED] PSRC=" << +m_psrc << " >= " << +m_psrc_limit
                       << " - P-EDCA blocked until next QSRC reset (successful TX)" << std::endl;
             ResumePedcaSuspendedACs();
         }
@@ -1168,8 +1168,8 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
         {
              // P-EDCA Priority Override: Stage 2 failed but PSRC < limit — retry Stage 1.
              // Check all D1.3 start conditions (including AIFSN nonzero, CIDs 7112/11411/11759).
-             bool qsrcOk = (m_qsrc >= PEDCA_RETRY_THRESHOLD);
-             bool retryLimitOk = (m_mac->GetFrameRetryLimit() > PEDCA_RETRY_THRESHOLD);
+             bool qsrcOk = (m_qsrc >= m_qsrc_threshold);
+             bool retryLimitOk = (m_mac->GetFrameRetryLimit() > m_qsrc_threshold);
              bool aifsn_nonzero = (m_edca->GetAifsn(m_linkId) > 0);
 
              if (qsrcOk && retryLimitOk && aifsn_nonzero)
@@ -1207,9 +1207,9 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
 
         // P-EDCA Priority Override: If all start conditions are still met after failure,
         // pre-generate DSr=0 backoff so Stage 1 fires at the P-EDCA slot boundary immediately.
-        bool qsrcOk = (m_qsrc >= PEDCA_RETRY_THRESHOLD);
-        bool psrcOk = (m_psrc < PEDCA_CONSECUTIVE_ATTEMPT);
-        bool retryLimitOk = (m_mac->GetFrameRetryLimit() > PEDCA_RETRY_THRESHOLD);
+        bool qsrcOk = (m_qsrc >= m_qsrc_threshold);
+        bool psrcOk = (m_psrc < m_psrc_limit);
+        bool retryLimitOk = (m_mac->GetFrameRetryLimit() > m_qsrc_threshold);
         bool aifsn_nonzero = (m_edca->GetAifsn(m_linkId) > 0);  // CIDs 7112/11411/11759
 
         if (qsrcOk && psrcOk && retryLimitOk && aifsn_nonzero)
@@ -1247,7 +1247,7 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
         // We must override this with DSr drawn from [0, CWds] so the DS-CTS fires at:
         //   LastBusy + SIFS + AIFSN*Slot + DSr*Slot  (= P-EDCA slot boundary per D1.3)
         if (m_mac->GetPedcaSupported() && m_edca->GetAccessCategory() == AC_VO &&
-            m_qsrc >= PEDCA_RETRY_THRESHOLD && m_psrc < PEDCA_CONSECUTIVE_ATTEMPT)
+            m_qsrc >= m_qsrc_threshold && m_psrc < m_psrc_limit)
         {
              Ptr<ChannelAccessManager> cam = m_mac->GetChannelAccessManager(m_linkId);
              if (cam)

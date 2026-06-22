@@ -49,8 +49,14 @@ class QosFrameExchangeManager : public FrameExchangeManager
     uint32_t GetPedcaFailTimingExpired() const { return m_pedcaFailTimingExpired; }
     uint32_t GetPedcaFailDeferral() const { return m_pedcaFailDeferral; }
 
-    /** Set the P-EDCA Stage-1 contention window (CWds).  Must be called before simulation start. */
+    /** Set CWds (Stage-1 contention window).  0=immediate, 1=random[0,1], … */
     void SetCwds(uint32_t cwds) { m_cwds = cwds; }
+    /** Set dot11PEDCARetryThreshold (QSRC must reach this value to trigger P-EDCA). */
+    void SetQsrc(uint16_t qsrc) { m_qsrc_threshold = qsrc; }
+    /** Set dot11PEDCAConsecutiveAttempt (max consecutive P-EDCA attempts per QSRC cycle). */
+    void SetPsrc(uint8_t psrc)  { m_psrc_limit = psrc; }
+    uint16_t GetQsrcThreshold() const { return m_qsrc_threshold; }
+    uint8_t  GetPsrcLimit()     const { return m_psrc_limit; }
 
     // Per-attempt P-EDCA record for backoff vs failure analysis
     struct PedcaAttemptRecord
@@ -260,9 +266,10 @@ class QosFrameExchangeManager : public FrameExchangeManager
     uint16_t m_qsrc{0};                      //!< Queue Size Retry Counter (tracks VO retry conditions)
     uint32_t m_cwds{0};                      //!< CWds: Stage-1 contention window (0 = ASAP, 1+ = random backoff)
 
-    // P-EDCA thresholds (configurable, per 802.11be draft spec)
-    static constexpr uint16_t PEDCA_RETRY_THRESHOLD = 2;       //!< dot11PEDCARetryThreshold (default=2)
-    static constexpr uint8_t PEDCA_CONSECUTIVE_ATTEMPT = 1;    //!< dot11PEDCAConsecutiveAttempt (draft D1.1 default=1)
+    // P-EDCA thresholds — runtime-configurable (set via SetQsrc/SetPsrc before sim start,
+    // or dynamically from AP via future signalling).  Defaults match 802.11be draft D1.1.
+    uint16_t m_qsrc_threshold{2};   //!< dot11PEDCARetryThreshold   (QSRC must reach this to trigger P-EDCA)
+    uint8_t  m_psrc_limit{1};       //!< dot11PEDCAConsecutiveAttempt (max consecutive P-EDCA attempts)
     
     // P-EDCA timing tracking for verification
     Time m_pedcaCtsTxEnd{0};  //!< DS-CTS transmission end time for timing verification
