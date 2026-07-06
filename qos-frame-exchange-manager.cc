@@ -320,8 +320,11 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                 // CIDs 7112/11411/11759: AIFSN[AC_VO] must be nonzero for P-EDCA slot boundary to be defined
                 bool aifsn_nonzero = (m_edca->GetAifsn(m_linkId) > 0);
                 
-                // DEFERRAL RULES: Check EIFS (implicit), CTS/Ack Timeout, and NAV
-                bool navActive = !VirtualCsMediumIdle();
+                // DEFERRAL RULES: Check EIFS (implicit), CTS/Ack Timeout, and NAV.
+                // P-EDCA preempts the intra-BSS NAV (own-BSS RTS/CTS/DATA): under
+                // 11be PedcaVirtualCsMediumIdle() ignores m_intraBssNavEnd so the
+                // DS-CTS can grab the channel; inter-BSS NAV is still honored.
+                bool navActive = !PedcaVirtualCsMediumIdle();
                 bool phyBusy = (m_phy->IsStateTx() || m_phy->IsStateRx() || m_phy->IsStateSwitching() || m_phy->IsStateCcaBusy());
 
                 bool deferralRequired = waitingForResponse || navActive || phyBusy;

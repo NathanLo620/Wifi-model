@@ -276,6 +276,15 @@ class FrameExchangeManager : public Object
     virtual bool VirtualCsMediumIdle() const;
 
     /**
+     * Virtual CS check used to gate a P-EDCA Stage-1 DS-CTS. Identical to
+     * VirtualCsMediumIdle() except that subclasses maintaining an intra-BSS NAV
+     * exclude it here: a P-EDCA DS-CTS preempts the intra-BSS NAV by design.
+     *
+     * @return true if the medium is idle for the purpose of sending a P-EDCA DS-CTS
+     */
+    virtual bool PedcaVirtualCsMediumIdle() const;
+
+    /**
      * @return the set of stations that have successfully received an RTS in this TXOP.
      */
     const std::set<Mac48Address>& GetProtectedStas() const;

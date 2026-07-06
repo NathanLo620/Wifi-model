@@ -59,6 +59,7 @@ class HeFrameExchangeManager : public VhtFrameExchangeManager
     std::optional<Mac48Address> FindTxopHolder(const WifiMacHeader& hdr,
                                                const WifiTxVector& txVector) override;
     bool VirtualCsMediumIdle() const override;
+    bool PedcaVirtualCsMediumIdle() const override;
 
     /**
      * Set the Multi-user Scheduler associated with this Frame Exchange Manager.

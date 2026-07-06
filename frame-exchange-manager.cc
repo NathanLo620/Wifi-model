@@ -1503,6 +1503,14 @@ FrameExchangeManager::VirtualCsMediumIdle() const
            (!m_channelAccessManager || m_channelAccessManager->GetNavEnd() <= now);
 }
 
+bool
+FrameExchangeManager::PedcaVirtualCsMediumIdle() const
+{
+    // No intra-BSS NAV exists at this layer (11a/g/n/ac): identical to the
+    // normal virtual CS check. HE/EHT override this to preempt the intra-BSS NAV.
+    return VirtualCsMediumIdle();
+}
+
 void
 FrameExchangeManager::ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
                                   RxSignalInfo rxSignalInfo,

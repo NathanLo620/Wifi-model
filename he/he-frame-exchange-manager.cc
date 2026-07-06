@@ -2191,6 +2191,14 @@ HeFrameExchangeManager::VirtualCsMediumIdle() const
 }
 
 bool
+HeFrameExchangeManager::PedcaVirtualCsMediumIdle() const
+{
+    // P-EDCA preempts the intra-BSS NAV: a DS-CTS may be sent while the
+    // intra-BSS NAV is set. Only the basic (inter-BSS) NAV still gates it.
+    return m_navEnd <= Simulator::Now();
+}
+
+bool
 HeFrameExchangeManager::UlMuCsMediumIdle(const CtrlTriggerHeader& trigger) const
 {
     if (!trigger.GetCsRequired())

@@ -261,7 +261,7 @@ class QosFrameExchangeManager : public FrameExchangeManager
     // P-EDCA state variables
     bool m_pedcaPending{false};              //!< True if DS-CTS was sent and we are in P-EDCA backoff
     
-    // P-EDCA PSRC/QSRC counters (per 802.11be spec)
+    // P-EDCA PSRC/QSRC counters (per 802.11bn spec)
     uint8_t m_psrc{0};                       //!< P-EDCA STA Retry Counter (consecutive DS-CTS attempts)
     uint16_t m_qsrc{0};                      //!< Queue Size Retry Counter (tracks VO retry conditions)
     uint32_t m_cwds{0};                      //!< CWds: Stage-1 contention window (0 = ASAP, 1+ = random backoff)
