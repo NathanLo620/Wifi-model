@@ -321,9 +321,8 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                 bool aifsn_nonzero = (m_edca->GetAifsn(m_linkId) > 0);
                 
                 // DEFERRAL RULES: Check EIFS (implicit), CTS/Ack Timeout, and NAV.
-                // P-EDCA preempts the intra-BSS NAV (own-BSS RTS/CTS/DATA): under
-                // 11be PedcaVirtualCsMediumIdle() ignores m_intraBssNavEnd so the
-                // DS-CTS can grab the channel; inter-BSS NAV is still honored.
+                // DS-CTS follows virtual carrier sensing. HE/EHT STAs therefore
+                // defer while either the basic or intra-BSS NAV is active.
                 bool navActive = !PedcaVirtualCsMediumIdle();
                 bool phyBusy = (m_phy->IsStateTx() || m_phy->IsStateRx() || m_phy->IsStateSwitching() || m_phy->IsStateCcaBusy());
 

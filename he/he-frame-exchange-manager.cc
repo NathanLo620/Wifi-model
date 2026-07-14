@@ -2193,9 +2193,9 @@ HeFrameExchangeManager::VirtualCsMediumIdle() const
 bool
 HeFrameExchangeManager::PedcaVirtualCsMediumIdle() const
 {
-    // P-EDCA preempts the intra-BSS NAV: a DS-CTS may be sent while the
-    // intra-BSS NAV is set. Only the basic (inter-BSS) NAV still gates it.
-    return m_navEnd <= Simulator::Now();
+    // DS-CTS transmission is gated by virtual carrier sensing. For an HE/EHT
+    // STA, the medium is virtually idle only when both NAV timers are zero.
+    return VirtualCsMediumIdle();
 }
 
 bool

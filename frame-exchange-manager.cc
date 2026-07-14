@@ -1506,8 +1506,8 @@ FrameExchangeManager::VirtualCsMediumIdle() const
 bool
 FrameExchangeManager::PedcaVirtualCsMediumIdle() const
 {
-    // No intra-BSS NAV exists at this layer (11a/g/n/ac): identical to the
-    // normal virtual CS check. HE/EHT override this to preempt the intra-BSS NAV.
+    // No intra-BSS NAV exists at this layer (11a/g/n/ac), so this is identical
+    // to the normal virtual CS check. HE/EHT override it to check both NAVs.
     return VirtualCsMediumIdle();
 }
 
