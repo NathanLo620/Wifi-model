@@ -338,20 +338,20 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                                << (waitingForResponse ? "WaitingForResponse " : "")
                                << (navActive ? "NAV>0 " : "")
                                << (phyBusy ? "PHY-Busy " : "")
-                               << "-> Aborting DS-CTS schedule (Fallback/Defer)" << std::endl;
+                               << "-> Deferring DS-CTS and returning to EDCA backoff" << std::endl;
                      
                      // If deferral is required, we effectively "do NOT schedule DS-CTS".
                      // We must abort this access attempt to respect the deferral rules.
-                     NotifyChannelReleased(m_edca);
-                     
-                     // P-EDCA TIMING FIX:
-                     // If we defer P-EDCA (e.g. due to busy medium), we should retry using Stage 1 backoff.
-                     // Generate DSr (0~CWds) backoff slots if P-EDCA conditions are met.
-                     if (qsrcOk && psrcOk && retryLimitOk && aifsn_nonzero)
-                     {
-                         std::clog << "[P-EDCA PRIORITY] Deferred: Generating Stage 1 backoff (CWds=0) for ASAP retry" << std::endl;
-                         m_edca->GeneratePedcaStage1Backoff(m_cwds, m_linkId);
-                     }
+                     auto deferredEdca = m_edca;
+                     NotifyChannelReleased(deferredEdca);
+
+                     // The access grant produced no transmission. Generate a
+                     // normal EDCA backoff explicitly because the CAM default
+                     // does not do so for a TXOP that sent no frame.
+                     deferredEdca->GenerateBackoff(m_linkId);
+                     Simulator::ScheduleNow(&QosTxop::RequestAccess,
+                                            deferredEdca,
+                                            m_linkId);
                      
                      m_edca = nullptr;
                      return false;
