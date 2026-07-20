@@ -263,7 +263,13 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
         NS_ASSERT(m_edca->GetTxopLimit(m_linkId).IsStrictlyPositive());
         NS_ASSERT(m_edca->GetTxopStartTime(m_linkId));
         NS_ASSERT(!m_pifsRecovery);
-        NS_ASSERT(!m_initialFrame);
+        if (m_initialFrame)
+        {
+            std::clog << "[TXOP STATE NORMALIZE] Backoff continuation supersedes stale "
+                         "initial-frame state at t="
+                      << Simulator::Now().GetMicroSeconds() << "us" << std::endl;
+            m_initialFrame = false;
+        }
 
         // clear the member variable
         m_edcaBackingOff = nullptr;
@@ -431,8 +437,10 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     ctsHeader.SetNoRetry();
                     ctsHeader.SetAddr1(Mac48Address("00:0F:AC:47:43:00")); // P-EDCA fixed RA (per draft)
                     
-                    // P-EDCA DS-CTS Duration: 77µs (per P-EDCA standard/draft resolutions)
-                    // Reserves a 77us contention window:
+                    // This implementation currently uses a 79us DS-CTS Duration field.
+                    // The draft notes used by this project mention 77us; verify the
+                    // intended 77/79us value before changing this protocol constant.
+                    // Reserves a 79us contention window:
                     //   - NAV freezes non-P-EDCA STAs
                     //   - P-EDCA STAs contend with (CW=7, AIFSN=2) 
                     Time pedcaWindowDuration = MicroSeconds(79);
@@ -510,8 +518,8 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     // PhyTxEnd fires from WifiPhy::TxDone at the EXACT CTS TX end time,
                     // with no polling delay.  From that moment, Stage 2 timing is:
                     //   AIFS(34µs) + backoff(0–63µs) = [34, 97]µs from ctsTxEnd.
-                    //   NAV window = 77µs → backoff 0–4 (gap 34–70µs) are protected (5/8 = 62.5%).
-                    //   Backoff 5–7 (gap 79–97µs) exceed 77µs → TIMING EXPIRED (3/8 = 37.5%).
+                    //   NAV window = 79us -> backoff 0-5 (gap 34-79us) fit theoretically.
+                    //   Backoff 6-7 (gap 88-97us) exceed 79us.
                     m_pedcaEdca = m_edca;
                     m_pedcaTxEndPending = true;  // arm the permanently-connected PhyTxEnd callback
 
@@ -527,7 +535,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                      Time payloadStart = Simulator::Now();
                      bool stage2Valid = false;
 
-                     // Determine if this is a valid P-EDCA transmission within the 77us window
+                     // Determine if this is a valid P-EDCA transmission within the 79us window
                      if (m_pedcaCtsTxEnd > Seconds(0))
                      {
                          Time gap = payloadStart - m_pedcaCtsTxEnd;
@@ -548,7 +556,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                              ? static_cast<int>((gapUs - AIFS_US) / SLOT_US + 0.5)
                              : -1;
 
-                         // NAV window = 77µs (802.11bn draft).  Stage 2 itself should still
+                         // Current implementation window is 79us. Stage 2 itself should still
                          // start shortly after DS-CTS; if normal EDCA/NAV/CCA activity delays
                          // it past the implementation deadline, the pending Stage 2 attempt is
                          // stale and must not be transmitted as a P-EDCA RTS.
@@ -558,7 +566,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                              stage2Valid = true;
                          } else if (gapUs <= PEDCA_STAGE2_DEADLINE_US) {
                              std::clog << " ⚠ NAV WINDOW EXPIRED (gap=" << gapUs
-                                       << "us > 77us) - within Stage 2 deadline, continuing"
+                                       << "us > 79us) - within Stage 2 deadline, continuing"
                                        << std::endl;
                              m_stage2TxStartCount++;
                              stage2Valid = true;
@@ -1242,6 +1250,9 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
         {
             m_edca->UpdateFailedCw(m_linkId);
         }
+        // The initial TXOP is terminated before releasing the EDCAF. The
+        // release path can request access immediately when NAV expires.
+        m_initialFrame = false;
         NotifyChannelReleased(m_edca);
         
         // P-EDCA TIMING FIX:
@@ -1313,14 +1324,20 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
             // method of the Txop class, which only generates a new backoff value and
             // requests channel access if needed,
             NS_LOG_DEBUG("TX of a non-initial frame of a TXOP failed: invoke backoff");
-            m_edca->Txop::NotifyChannelReleased(m_linkId);
             // CW and QSRC shall be updated in this case (see Section 10.23.2.2 of 802.11-2020)
             if (!forceCurrentCw)
             {
                 m_edca->UpdateFailedCw(m_linkId);
             }
-            m_edcaBackingOff = m_edca;
+            // Publish the complete backing-off state before releasing the
+            // EDCAF. NotifyChannelReleased may request access immediately when
+            // NAV has just expired, so callbacks must not observe an initial
+            // frame that is already transitioning to backoff.
+            auto backingOffEdca = m_edca;
+            m_edcaBackingOff = backingOffEdca;
+            m_initialFrame = false;
             m_edca = nullptr;
+            backingOffEdca->Txop::NotifyChannelReleased(m_linkId);
         }
     }
     m_initialFrame = false;

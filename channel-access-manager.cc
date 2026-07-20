@@ -98,22 +98,6 @@ class PhyListener : public ns3::WifiPhyListener
         }
     }
 
-    void NotifyPreambleDetectFailure(const WifiTxVector& txVector) override
-    {
-        if (m_active)
-        {
-            m_cam->NotifyPreambleDetectFailureNow(txVector);
-        }
-    }
-
-    void NotifyNavStart(Time duration) override
-    {
-        if (m_active)
-        {
-            m_cam->NotifyNavStartNow(duration);
-        }
-    }
-
     void NotifyTxStart(Time duration, dBm_u txPower) override
     {
         if (m_active)
@@ -1107,20 +1091,6 @@ ChannelAccessManager::NotifyRxEndErrorNow(const WifiTxVector& txVector)
 }
 
 void
-ChannelAccessManager::NotifyPreambleDetectFailureNow(const WifiTxVector& txVector)
-{
-    NS_LOG_FUNCTION(this);
-    NS_LOG_DEBUG("preamble detect failure -> force EIFS");
-    // PHY detected energy but couldn't lock the preamble: treat as failed RX so
-    // the next access uses EIFS instead of AIFS (IEEE 802.11 EIFS rule applies
-    // whenever a frame on the medium was not successfully received).
-    m_lastRx.start = Simulator::Now();
-    m_lastRx.end = Simulator::Now();
-    m_lastRxReceivedOk = false;
-    m_eifsNoDifs = m_phy->GetSifs() + GetEstimatedAckTxTime(txVector);
-}
-
-void
 ChannelAccessManager::NotifyTxStartNow(Time duration)
 {
     NS_LOG_FUNCTION(this << duration);
@@ -1363,14 +1333,7 @@ void
 ChannelAccessManager::NotifyNavStartNow(Time duration)
 {
     NS_LOG_FUNCTION(this << duration);
-    
-    // Log P-EDCA relevant NAV updates (97us or close)
-    if (duration.GetMicroSeconds() >= 90 && duration.GetMicroSeconds() <= 100)
-    {
-        NS_LOG_INFO("[NAV] P-EDCA CTS received: NAV=" << duration.GetMicroSeconds() 
-                     << "us at t=" << Simulator::Now().GetMicroSeconds() << "us");
-    }
-    
+    NS_LOG_DEBUG("nav start for=" << duration);
     UpdateBackoff();
     m_lastNavEnd = std::max(m_lastNavEnd, Simulator::Now() + duration);
 }

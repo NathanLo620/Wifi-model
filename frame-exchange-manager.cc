@@ -322,15 +322,6 @@ FrameExchangeManager::ReceivedMacHdr(const WifiMacHeader& macHdr,
 {
     NS_LOG_FUNCTION(this << macHdr << txVector << psduDuration.As(Time::MS));
     
-    // P-EDCA Debug: Log when CTS frames are received at MAC header level
-    if (macHdr.IsCts())
-    {
-        NS_LOG_DEBUG("P-EDCA-DEBUG: ReceivedMacHdr CTS! RA=" << macHdr.GetAddr1()
-                     << " Duration=" << macHdr.GetDuration().GetMicroSeconds() << "us"
-                     << " psduDuration=" << psduDuration.GetMicroSeconds() << "us"
-                     << " m_self=" << m_self);
-    }
-    
     m_ongoingRxInfo = {macHdr, txVector, Simulator::Now() + psduDuration};
     UpdateNav(macHdr, txVector, psduDuration);
 }
@@ -840,12 +831,6 @@ FrameExchangeManager::SendRts(const WifiTxParameters& txParams)
 
     ForwardMpduDown(mpdu, rtsCtsProtection->rtsTxVector);
 
-    // P-EDCA TRACE: Log RTS send time
-    std::clog << "[RTS SENT] STA=" << m_self
-              << " to=" << receiver
-              << " at t=" << Simulator::Now().GetMicroSeconds() << "us"
-              << " dur=" << rts.GetDuration().GetMicroSeconds() << "us"
-              << std::endl;
 }
 
 void
@@ -880,12 +865,6 @@ FrameExchangeManager::DoSendCtsAfterRts(const WifiMacHeader& rtsHdr,
     // CTS should always use non-HT PPDU (HT PPDU cases not supported yet)
     ForwardMpduDown(Create<WifiMpdu>(packet, cts), ctsTxVector);
 
-    // P-EDCA TRACE: Log AP CTS reply
-    std::clog << "[CTS SENT] AP/STA=" << m_self
-              << " to=" << rtsHdr.GetAddr2()
-              << " at t=" << Simulator::Now().GetMicroSeconds() << "us"
-              << " dur=" << cts.GetDuration().GetMicroSeconds() << "us"
-              << std::endl;
 }
 
 void
@@ -947,19 +926,6 @@ FrameExchangeManager::SendNormalAck(const WifiMacHeader& hdr,
                                     double dataSnr)
 {
     NS_LOG_FUNCTION(this << hdr << dataTxVector << dataSnr);
-
-    // P-EDCA: suppress ACK if DS-CTS NAV is currently active. This stops the
-    // AP (or any STA) from TXing a SIFS-bounded ACK during the 77us P-EDCA
-    // contention window, which would otherwise pause stage-2 backoffs.
-    if (m_navEndFromDsCts > Simulator::Now())
-    {
-        std::clog << "[DS-CTS ACK-SUPPRESS] STA=" << m_self
-                  << " skipping ACK to " << hdr.GetAddr2()
-                  << " (DS-CTS NAV active until "
-                  << m_navEndFromDsCts.GetMicroSeconds() << "us, now="
-                  << Simulator::Now().GetMicroSeconds() << "us)" << std::endl;
-        return;
-    }
 
     WifiTxVector ackTxVector =
         GetWifiRemoteStationManager()->GetAckTxVector(hdr.GetAddr2(), dataTxVector);
@@ -1121,12 +1087,6 @@ FrameExchangeManager::CtsTimeout(Ptr<WifiMpdu> rts, const WifiTxVector& txVector
 {
     NS_LOG_FUNCTION(this << *rts << txVector);
 
-    // P-EDCA TRACE: Log CTS timeout
-    std::clog << "[CTS TIMEOUT] STA=" << m_self
-              << " at t=" << Simulator::Now().GetMicroSeconds() << "us"
-              << " (no CTS received after RTS)"
-              << std::endl;
-
     DoCtsTimeout(WifiPsduMap{{SU_STA_ID, Create<WifiPsdu>(m_mpdu, true)}});
     m_mpdu = nullptr;
 }
@@ -1269,17 +1229,6 @@ void
 FrameExchangeManager::PsduRxError(Ptr<const WifiPsdu> psdu)
 {
     NS_LOG_FUNCTION(this << psdu);
-    // [TEMP TRACE] Log CTS frames that failed PHY decode (collision)
-    if (psdu && psdu->GetNMpdus() == 1)
-    {
-        const auto& hdr = psdu->GetHeader(0);
-        if (hdr.IsCts() && hdr.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
-        {
-            std::clog << "[DS-CTS PHY-ERROR] STA=" << m_self
-                      << " FAILED to decode DS-CTS at t="
-                      << Simulator::Now().GetMicroSeconds() << "us (collision?)" << std::endl;
-        }
-    }
 }
 
 void
@@ -1299,18 +1248,6 @@ FrameExchangeManager::Receive(Ptr<const WifiPsdu> psdu,
     }
 
     Mac48Address addr1 = psdu->GetAddr1();
-
-    // [TEMP TRACE] Log DS-CTS arriving at Receive() from PHY
-    if (psdu->GetNMpdus() == 1)
-    {
-        const auto& hdr0 = psdu->GetHeader(0);
-        if (hdr0.IsCts() && hdr0.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
-        {
-            std::clog << "[DS-CTS RECV-ENTRY] STA=" << m_self
-                      << " PHY delivered DS-CTS at t="
-                      << Simulator::Now().GetMicroSeconds() << "us" << std::endl;
-        }
-    }
 
     if (addr1.IsGroup() || addr1 == m_self)
     {
@@ -1374,36 +1311,17 @@ FrameExchangeManager::UpdateNav(const WifiMacHeader& hdr,
 
     if (!hdr.HasNav())
     {
-        NS_LOG_DEBUG("P-EDCA-DEBUG: Frame has no NAV field, skipping NAV update");
         return;
     }
 
     Time duration = hdr.GetDuration();
     NS_LOG_DEBUG("Duration/ID=" << duration);
-    
-    // P-EDCA Debug: Log CTS frames specifically
-    if (hdr.IsCts())
-    {
-        NS_LOG_DEBUG("P-EDCA-DEBUG: Received CTS frame! RA=" << hdr.GetAddr1() 
-                     << " Duration=" << duration.GetMicroSeconds() << "us"
-                     << " surplus=" << surplus.GetMicroSeconds() << "us"
-                     << " m_self=" << m_self);
-        // [TEMP TRACE] Log DS-CTS NAV update
-        if (hdr.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
-        {
-            std::clog << "[DS-CTS NAV-RX] STA=" << m_self
-                      << " received DS-CTS, Duration=" << duration.GetMicroSeconds()
-                      << "us at t=" << Simulator::Now().GetMicroSeconds() << "us" << std::endl;
-        }
-    }
-    
     duration += surplus;
 
     if (hdr.GetAddr1() == m_self)
     {
         // When the received frame's RA is equal to the STA's own MAC address, the STA
         // shall not update its NAV (IEEE 802.11-2016, sec. 10.3.2.4)
-        NS_LOG_DEBUG("P-EDCA-DEBUG: Frame RA=" << hdr.GetAddr1() << " equals m_self, NOT updating NAV");
         return;
     }
 
@@ -1414,26 +1332,11 @@ FrameExchangeManager::UpdateNav(const WifiMacHeader& hdr,
     {
         m_navEnd = navEnd;
         NS_LOG_DEBUG("Updated NAV=" << m_navEnd);
-        // [TEMP TRACE] Confirm NAV was set for DS-CTS
+        // Remember DS-CTS ownership so the P-EDCA Stage-2 RTS can be answered
+        // inside the protected window. This does not alter normal EDCA NAV handling.
         if (hdr.IsCts() && hdr.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
         {
-            // Mark NAV as set by DS-CTS so we can suppress SIFS-bounded ACKs that
-            // would otherwise fire during the P-EDCA contention window.
             m_navEndFromDsCts = navEnd;
-            std::clog << "[DS-CTS NAV-SET] STA=" << m_self
-                      << " NAV set to " << m_navEnd.GetMicroSeconds()
-                      << "us (duration=" << duration.GetMicroSeconds() << "us)"
-                      << std::endl;
-        }
-        // [TEMP TRACE] Confirm NAV was set by an RTS (so we can tell which STA
-        // captured an RTS instead of DS-CTS during a 4-way collision)
-        else if (hdr.IsRts())
-        {
-            std::clog << "[RTS NAV-SET] STA=" << m_self
-                      << " NAV set to " << m_navEnd.GetMicroSeconds()
-                      << "us (RTS from=" << hdr.GetAddr2()
-                      << ", duration=" << duration.GetMicroSeconds() << "us)"
-                      << std::endl;
         }
 
         // A STA that used information from an RTS frame as the most recent basis to update
@@ -1469,6 +1372,7 @@ FrameExchangeManager::NavResetTimeout()
 {
     NS_LOG_FUNCTION(this);
     m_navEnd = Simulator::Now();
+    m_navEndFromDsCts = Simulator::Now();
     m_channelAccessManager->NotifyNavResetNow(Seconds(0));
 }
 
@@ -1498,9 +1402,7 @@ FrameExchangeManager::ResetTxNav()
 bool
 FrameExchangeManager::VirtualCsMediumIdle() const
 {
-    const auto now = Simulator::Now();
-    return m_navEnd <= now &&
-           (!m_channelAccessManager || m_channelAccessManager->GetNavEnd() <= now);
+    return m_navEnd <= Simulator::Now();
 }
 
 bool
@@ -1534,17 +1436,8 @@ FrameExchangeManager::ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
             // - If the NAV indicates idle, the STA shall respond with a CTS frame after a SIFS
             // - Otherwise, the STA shall not respond with a CTS frame
             // (IEEE 802.11-2016 sec. 10.3.2.7)
-            //
-            // P-EDCA exception: if NAV was set by a DS-CTS, this RTS is from the
-            // P-EDCA stage-2 winner and the receiver (AP) must reply CTS so the
-            // exchange can complete inside the protected window.
-            const bool dsCtsNavExempt = (m_navEndFromDsCts > Simulator::Now());
-            if (VirtualCsMediumIdle() || dsCtsNavExempt)
+            if (VirtualCsMediumIdle())
             {
-                std::clog << "[RTS-RX] t=" << Simulator::Now().GetMicroSeconds()
-                          << "us STA=" << m_self << " from=" << hdr.GetAddr2()
-                          << ", VirtualCS IDLE (NAV=" << m_navEnd.GetMicroSeconds()
-                          << "us) -> will send CTS after SIFS" << std::endl;
                 NS_LOG_DEBUG("Received RTS from=" << hdr.GetAddr2() << ", schedule CTS");
                 m_sendCtsEvent = Simulator::Schedule(m_phy->GetSifs(),
                                                      &FrameExchangeManager::SendCtsAfterRts,
@@ -1555,11 +1448,6 @@ FrameExchangeManager::ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
             }
             else
             {
-                std::clog << "[RTS-RX] t=" << Simulator::Now().GetMicroSeconds()
-                          << "us STA=" << m_self << " from=" << hdr.GetAddr2()
-                          << ", VirtualCS BUSY (NAV=" << m_navEnd.GetMicroSeconds()
-                          << "us, NAV-remaining=" << (m_navEnd - Simulator::Now()).GetMicroSeconds()
-                          << "us) -> CANNOT send CTS" << std::endl;
                 NS_LOG_DEBUG("Received RTS from=" << hdr.GetAddr2() << ", cannot schedule CTS");
             }
         }

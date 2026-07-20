@@ -12,8 +12,6 @@
 
 #include "wifi-phy-common.h"
 
-#include "ns3/nstime.h"
-
 #include <vector>
 
 namespace ns3
@@ -62,25 +60,6 @@ class WifiPhyListener
      * _not_ been successfully received.
      */
     virtual void NotifyRxEndError(const WifiTxVector& txVector) = 0;
-    /**
-     * @param txVector the TXVECTOR of the packet whose preamble detection failed.
-     *
-     * Preamble energy was detected but could not be decoded (PREAMBLE_DETECT_FAILURE).
-     * Listeners that implement EIFS deferral should treat this as a failed RX.
-     */
-    virtual void NotifyPreambleDetectFailure(const WifiTxVector& txVector)
-    {
-    }
-    /**
-     * @param duration the NAV duration to apply.
-     *
-     * The PHY identified a protection frame whose MAC header may not be delivered
-     * to the MAC due to a collision. Listeners that maintain virtual carrier sense
-     * may conservatively apply this NAV duration.
-     */
-    virtual void NotifyNavStart(Time duration)
-    {
-    }
     /**
      * @param duration the expected transmission duration.
      * @param txPower the nominal TX power

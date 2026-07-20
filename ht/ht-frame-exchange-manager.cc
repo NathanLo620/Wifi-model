@@ -1697,17 +1697,6 @@ HtFrameExchangeManager::SendBlockAck(const RecipientBlockAckAgreement& agreement
 {
     NS_LOG_FUNCTION(this << durationId << blockAckTxVector << rxSnr << gcrGroupAddr.has_value());
 
-    // P-EDCA: suppress BlockAck if DS-CTS NAV is currently active.
-    if (m_navEndFromDsCts > Simulator::Now())
-    {
-        std::clog << "[DS-CTS BACK-SUPPRESS] STA=" << m_self
-                  << " skipping BlockAck to " << agreement.GetPeer()
-                  << " (DS-CTS NAV active until "
-                  << m_navEndFromDsCts.GetMicroSeconds() << "us, now="
-                  << Simulator::Now().GetMicroSeconds() << "us)" << std::endl;
-        return;
-    }
-
     WifiMacHeader hdr;
     hdr.SetType(WIFI_MAC_CTL_BACKRESP);
     auto addr1 = agreement.GetPeer();

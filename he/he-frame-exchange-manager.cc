@@ -24,7 +24,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <iostream>
 
 #undef NS_LOG_APPEND_CONTEXT
 #define NS_LOG_APPEND_CONTEXT WIFI_FEM_NS_LOG_APPEND_CONTEXT
@@ -2015,15 +2014,6 @@ HeFrameExchangeManager::IsIntraBssPpdu(const WifiMacHeader& hdr, const WifiTxVec
         return true;
     }
 
-    // A CF-End from the saved TXOP holder terminates the intra-BSS TXOP that
-    // established the current intra-BSS NAV. CF-End has no BSSID field and
-    // uses a broadcast RA, so the generic address rules below cannot identify
-    // this case as intra-BSS.
-    if (hdr.IsCfEnd() && ta == m_txopHolder)
-    {
-        return true;
-    }
-
     // If we get here, the intra-BSS conditions using MAC address information are not satisfied.
     // "If the received PPDU satisfies the intra-BSS conditions using the RXVECTOR parameter
     // BSS_COLOR and also satisfies the inter-BSS conditions using MAC address information of a
@@ -2160,7 +2150,12 @@ HeFrameExchangeManager::NavResetTimeout()
     m_navEnd = Simulator::Now();
     // Do not reset the TXOP holder because the basic NAV is updated by inter-BSS frames
     // The NAV seen by the ChannelAccessManager is now the intra-BSS NAV only
-    Time intraBssNav = std::max(m_intraBssNavEnd - Simulator::Now(), Seconds(0));
+    Time intraBssNav = Simulator::GetDelayLeft(m_intraBssNavResetEvent);
+    // Keep the internal NAV and CAM representation synchronized. RX-start may
+    // have cancelled the reset event, in which case upstream semantics treat
+    // the corresponding NAV as no longer active.
+    m_intraBssNavEnd = Simulator::Now() + intraBssNav;
+    ClearTxopHolderIfNeeded();
     m_channelAccessManager->NotifyNavResetNow(intraBssNav);
 }
 
@@ -2171,7 +2166,12 @@ HeFrameExchangeManager::IntraBssNavResetTimeout()
     m_intraBssNavEnd = Simulator::Now();
     ClearTxopHolderIfNeeded();
     // The NAV seen by the ChannelAccessManager is now the basic NAV only
-    Time basicNav = std::max(m_navEnd - Simulator::Now(), Seconds(0));
+    Time basicNav = Simulator::GetDelayLeft(m_navResetEvent);
+    m_navEnd = Simulator::Now() + basicNav;
+    if (basicNav.IsZero())
+    {
+        m_navEndFromDsCts = Simulator::Now();
+    }
     m_channelAccessManager->NotifyNavResetNow(basicNav);
 }
 
@@ -2197,29 +2197,23 @@ HeFrameExchangeManager::VirtualCsMediumIdle() const
     // For an HE STA maintaining two NAVs, if both the NAV timers are 0, the virtual CS indication
     // is that the medium is idle; if at least one of the two NAV timers is nonzero, the virtual CS
     // indication is that the medium is busy. (Sec. 26.2.4 of 802.11ax-2021)
-    return m_navEnd <= Simulator::Now() && m_intraBssNavEnd <= Simulator::Now();
+    const auto now = Simulator::Now();
+    const bool navTimersIdle = m_navEnd <= now && m_intraBssNavEnd <= now;
+    const bool camNavIdle = m_channelAccessManager->GetNavEnd() <= now;
+    NS_ASSERT_MSG(navTimersIdle == camNavIdle,
+                  "HE/EHT NAV disagreement at " << now.As(Time::US)
+                                                  << ": basicEnd=" << m_navEnd.As(Time::US)
+                                                  << ", intraEnd="
+                                                  << m_intraBssNavEnd.As(Time::US)
+                                                  << ", camEnd="
+                                                  << m_channelAccessManager->GetNavEnd().As(Time::US));
+    return navTimersIdle;
 }
 
 bool
 HeFrameExchangeManager::PedcaVirtualCsMediumIdle() const
 {
-    // DS-CTS transmission is gated by virtual carrier sensing. For an HE/EHT
-    // STA, the medium is virtually idle only when both NAV timers are zero.
-    const auto now = Simulator::Now();
-    const bool basicNavActive = m_navEnd > now;
-    const bool intraBssNavActive = m_intraBssNavEnd > now;
-    const auto camNavEnd = m_channelAccessManager->GetNavEnd();
-    if (basicNavActive || intraBssNavActive)
-    {
-        std::clog << "[P-EDCA NAV STATE] t=" << now.GetMicroSeconds()
-                  << "us self=" << m_self << " basicEnd=" << m_navEnd.GetMicroSeconds()
-                  << "us intraEnd=" << m_intraBssNavEnd.GetMicroSeconds()
-                  << "us camEnd=" << camNavEnd.GetMicroSeconds()
-                  << "us active=" << (basicNavActive ? "BASIC " : "")
-                  << (intraBssNavActive ? "INTRA" : "")
-                  << " cam=" << (camNavEnd > now ? "BUSY" : "IDLE") << std::endl;
-    }
-    return !basicNavActive && !intraBssNavActive;
+    return VirtualCsMediumIdle();
 }
 
 bool

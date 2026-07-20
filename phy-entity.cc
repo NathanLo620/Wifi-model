@@ -35,46 +35,6 @@ namespace ns3
 
 NS_LOG_COMPONENT_DEFINE("PhyEntity");
 
-namespace
-{
-
-bool
-GetPedcaDsCtsDuration(Ptr<const WifiPpdu> ppdu, Time& duration)
-{
-    if (!ppdu || !ppdu->GetPsdu())
-    {
-        return false;
-    }
-
-    const auto& header = ppdu->GetPsdu()->GetHeader(0);
-    if (header.IsCts() && header.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
-    {
-        duration = header.GetDuration();
-        return true;
-    }
-
-    return false;
-}
-
-void
-NotifyPedcaDsCtsNavStart(Ptr<WifiPhyStateHelper> state, Ptr<const WifiPpdu> ppdu, Time endRx)
-{
-    Time navDuration;
-    if (!GetPedcaDsCtsDuration(ppdu, navDuration))
-    {
-        return;
-    }
-
-    const auto remainingRx = endRx - Simulator::Now();
-    if (remainingRx.IsPositive())
-    {
-        navDuration += remainingRx;
-    }
-    state->NotifyNavStart(navDuration);
-}
-
-} // namespace
-
 std::ostream&
 operator<<(std::ostream& os, const PhyEntity::PhyRxFailureAction& action)
 {
@@ -549,14 +509,6 @@ PhyEntity::DropPreambleEvent(Ptr<const WifiPpdu> ppdu, WifiPhyRxfailureReason re
 {
     NS_LOG_FUNCTION(this << ppdu << reason << endRx);
     m_wifiPhy->NotifyRxPpduDrop(ppdu, reason);
-    if (reason != TXING)
-    {
-        NotifyPedcaDsCtsNavStart(m_state, ppdu, endRx);
-    }
-    if (reason == BUSY_DECODING_PREAMBLE || reason == PREAMBLE_DETECTION_PACKET_SWITCH)
-    {
-        m_state->NotifyPreambleDetectFailure(ppdu->GetTxVector());
-    }
     auto it = m_wifiPhy->m_currentPreambleEvents.find({ppdu->GetUid(), ppdu->GetPreamble()});
     if (it != m_wifiPhy->m_currentPreambleEvents.end())
     {
@@ -1107,8 +1059,6 @@ PhyEntity::EndPreambleDetectionPeriod(Ptr<Event> event)
                      << " during preamble detection: drop packet with UID "
                      << event->GetPpdu()->GetUid());
         m_wifiPhy->NotifyRxPpduDrop(event->GetPpdu(), BUSY_DECODING_PREAMBLE);
-        NotifyPedcaDsCtsNavStart(m_state, event->GetPpdu(), event->GetEndTime());
-        m_state->NotifyPreambleDetectFailure(event->GetPpdu()->GetTxVector());
 
         auto it = m_wifiPhy->m_currentPreambleEvents.find(
             {event->GetPpdu()->GetUid(), event->GetPpdu()->GetPreamble()});
@@ -1166,8 +1116,6 @@ PhyEntity::EndPreambleDetectionPeriod(Ptr<Event> event)
                     reason = BUSY_DECODING_PREAMBLE;
                 }
                 m_wifiPhy->NotifyRxPpduDrop(it->second->GetPpdu(), reason);
-                NotifyPedcaDsCtsNavStart(m_state, it->second->GetPpdu(), it->second->GetEndTime());
-                m_state->NotifyPreambleDetectFailure(it->second->GetPpdu()->GetTxVector());
 
                 it = m_wifiPhy->m_currentPreambleEvents.erase(it);
             }
@@ -1201,7 +1149,6 @@ PhyEntity::EndPreambleDetectionPeriod(Ptr<Event> event)
         NS_LOG_DEBUG("Drop packet because PHY preamble detection failed");
         // Like CCA-SD, CCA-ED is governed by the 4 us CCA window to flag CCA-BUSY
         // for any received signal greater than the CCA-ED threshold.
-        const auto failedTxVector = m_wifiPhy->m_currentEvent->GetPpdu()->GetTxVector();
         DropPreambleEvent(m_wifiPhy->m_currentEvent->GetPpdu(),
                           PREAMBLE_DETECT_FAILURE,
                           m_wifiPhy->m_currentEvent->GetEndTime());
@@ -1211,9 +1158,6 @@ PhyEntity::EndPreambleDetectionPeriod(Ptr<Event> event)
             m_wifiPhy->m_interference->NotifyRxEnd(Simulator::Now(),
                                                    m_wifiPhy->GetCurrentFrequencyRange());
         }
-        // Notify CAM that energy was detected but preamble was undecodable so it
-        // defers with EIFS (not AIFS) on the next channel access attempt.
-        m_state->NotifyPreambleDetectFailure(failedTxVector);
         m_wifiPhy->m_currentEvent = nullptr;
         // Cancel preamble reception
         m_wifiPhy->m_endPhyRxEvent.Cancel();
