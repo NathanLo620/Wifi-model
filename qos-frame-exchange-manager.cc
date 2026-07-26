@@ -437,13 +437,11 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     ctsHeader.SetNoRetry();
                     ctsHeader.SetAddr1(Mac48Address("00:0F:AC:47:43:00")); // P-EDCA fixed RA (per draft)
                     
-                    // This implementation currently uses a 79us DS-CTS Duration field.
-                    // The draft notes used by this project mention 77us; verify the
-                    // intended 77/79us value before changing this protocol constant.
-                    // Reserves a 79us contention window:
+                    // The current P-EDCA draft specifies an 81us DS-CTS Duration field.
+                    // Reserves an 81us contention window:
                     //   - NAV freezes non-P-EDCA STAs
                     //   - P-EDCA STAs contend with (CW=7, AIFSN=2) 
-                    Time pedcaWindowDuration = MicroSeconds(79);
+                    Time pedcaWindowDuration = MicroSeconds(81);
                     ctsHeader.SetDuration(pedcaWindowDuration);
 
                     // 3. Transmit DS-CTS using non-HT OFDM 6 Mbps (per P-EDCA draft 3.5)
@@ -518,8 +516,8 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     // PhyTxEnd fires from WifiPhy::TxDone at the EXACT CTS TX end time,
                     // with no polling delay.  From that moment, Stage 2 timing is:
                     //   AIFS(34µs) + backoff(0–63µs) = [34, 97]µs from ctsTxEnd.
-                    //   NAV window = 79us -> backoff 0-5 (gap 34-79us) fit theoretically.
-                    //   Backoff 6-7 (gap 88-97us) exceed 79us.
+                    //   NAV window = 81us -> backoff 0-5 (gap 34-79us) fit theoretically.
+                    //   Backoff 6-7 (gap 88-97us) exceed 81us.
                     m_pedcaEdca = m_edca;
                     m_pedcaTxEndPending = true;  // arm the permanently-connected PhyTxEnd callback
 
@@ -535,7 +533,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                      Time payloadStart = Simulator::Now();
                      bool stage2Valid = false;
 
-                     // Determine if this is a valid P-EDCA transmission within the 79us window
+                     // Determine whether P-EDCA transmission starts within the 81us NAV window.
                      if (m_pedcaCtsTxEnd > Seconds(0))
                      {
                          Time gap = payloadStart - m_pedcaCtsTxEnd;
@@ -545,8 +543,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                                    << "us, CTS TX end=" << m_pedcaCtsTxEnd.GetMicroSeconds()
                                    << "us, gap=" << gapUs << "us";
 
-                         constexpr double PEDCA_NAV_WINDOW_US = 79.0;
-                         constexpr double PEDCA_STAGE2_DEADLINE_US = 200.0;
+                         constexpr double PEDCA_NAV_WINDOW_US = 81.0;
 
                          // Capture per-attempt info (AIFS=34us, slot=9us assumed for OFDM 5GHz)
                          constexpr double AIFS_US = 34.0;
@@ -556,31 +553,19 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                              ? static_cast<int>((gapUs - AIFS_US) / SLOT_US + 0.5)
                              : -1;
 
-                         // Current implementation window is 79us. Stage 2 itself should still
-                         // start shortly after DS-CTS; if normal EDCA/NAV/CCA activity delays
-                         // it past the implementation deadline, the pending Stage 2 attempt is
-                         // stale and must not be transmitted as a P-EDCA RTS.
+                         // The 81us value is the DS-CTS NAV window, not a deadline for
+                         // cancelling Stage 2. Once the P-EDCA contention has started,
+                         // allow it to complete even if deferral extends beyond that window.
                          if (gapUs <= PEDCA_NAV_WINDOW_US) {
                              std::clog << " ✓ TIMING OK" << std::endl;
                               m_stage2TxStartCount++;  // TRACE: Stage 2 valid TX
                              stage2Valid = true;
-                         } else if (gapUs <= PEDCA_STAGE2_DEADLINE_US) {
+                         } else {
                              std::clog << " ⚠ NAV WINDOW EXPIRED (gap=" << gapUs
-                                       << "us > 79us) - within Stage 2 deadline, continuing"
+                                       << "us > 81us) - continuing Stage 2"
                                        << std::endl;
                              m_stage2TxStartCount++;
                              stage2Valid = true;
-                         } else {
-                             std::clog << " ✗ STALE STAGE2 (gap=" << gapUs
-                                       << "us > " << PEDCA_STAGE2_DEADLINE_US
-                                       << "us) - aborting P-EDCA Stage 2" << std::endl;
-                             m_pedcaFailTimingExpired++;
-                             m_pedcaAttempts.push_back({m_pedcaCtsTxEnd.GetMicroSeconds(),
-                                                       gapUs, m_lastBackoffSlots,
-                                                       "TIMING_EXPIRED"});
-                             m_lastStage2GapUs = -1.0;
-                             m_lastBackoffSlots = -1;
-                             stage2Valid = false;
                          }
                      }
                      else

@@ -64,7 +64,7 @@ class QosFrameExchangeManager : public FrameExchangeManager
         double dsCtsEndUs;       //!< Time when DS-CTS TX ended (microseconds)
         double gapUs;            //!< Effective gap from DS-CTS end to TX start (microseconds)
         int    backoffSlots;     //!< Reconstructed backoff slots = (gap-AIFS)/slotTime; -1 if unknown
-        std::string outcome;     //!< SUCCESS / RTS_CTS_TIMEOUT / RTS_COLLISION / TIMING_EXPIRED / DEFERRAL
+        std::string outcome;     //!< SUCCESS / RTS_CTS_TIMEOUT / RTS_COLLISION / DEFERRAL
     };
     const std::vector<PedcaAttemptRecord>& GetPedcaAttempts() const { return m_pedcaAttempts; }
 
@@ -300,7 +300,7 @@ class QosFrameExchangeManager : public FrameExchangeManager
     // Failure reason counters
     uint32_t m_pedcaFailRtsCtsTimeout{0};   //!< RTS sent during Stage 2 but AP didn't reply CTS
     uint32_t m_pedcaFailRtsCollision{0};    //!< RTS collision during Stage 2 (two P-EDCA STAs)
-    uint32_t m_pedcaFailTimingExpired{0};   //!< P-EDCA 77us window expired (legacy steal / slow backoff)
+    uint32_t m_pedcaFailTimingExpired{0};   //!< Legacy statistic retained for output compatibility
     uint32_t m_pedcaFailDeferral{0};        //!< P-EDCA deferred (medium busy before DS-CTS)
     // Event counters
     uint32_t m_dsCtsCount{0};              //!< Number of DS-CTS frames sent
