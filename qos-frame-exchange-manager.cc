@@ -94,6 +94,27 @@ QosFrameExchangeManager::~QosFrameExchangeManager()
 }
 
 void
+QosFrameExchangeManager::SetChannelAccessManager(
+    const Ptr<ChannelAccessManager> channelAccessManager)
+{
+    if (m_channelAccessManager)
+    {
+        m_channelAccessManager->TraceDisconnectWithoutContext(
+            "MediumBusy",
+            MakeCallback(&QosFrameExchangeManager::PedcaMediumBusy, this));
+    }
+
+    FrameExchangeManager::SetChannelAccessManager(channelAccessManager);
+
+    if (m_channelAccessManager)
+    {
+        m_channelAccessManager->TraceConnectWithoutContext(
+            "MediumBusy",
+            MakeCallback(&QosFrameExchangeManager::PedcaMediumBusy, this));
+    }
+}
+
+void
 QosFrameExchangeManager::SetWifiPhy(Ptr<WifiPhy> phy)
 {
     FrameExchangeManager::SetWifiPhy(phy);
@@ -120,6 +141,12 @@ void
 QosFrameExchangeManager::DoDispose()
 {
     NS_LOG_FUNCTION(this);
+    if (m_channelAccessManager)
+    {
+        m_channelAccessManager->TraceDisconnectWithoutContext(
+            "MediumBusy",
+            MakeCallback(&QosFrameExchangeManager::PedcaMediumBusy, this));
+    }
     m_edca = nullptr;
     m_edcaBackingOff = nullptr;
     m_pifsRecoveryEvent.Cancel();
@@ -1097,10 +1124,9 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
     // P-EDCA Stage 2 Collision Detection
     if (m_pedcaStage2Active && m_edca && m_edca->GetAccessCategory() == AC_VO)
     {
-        // Stage 2 failure: Could be RTS collision (two P-EDCA STAs), CTS timeout (AP didn't reply), 
-        // or ACK timeout (data frame collided). All are P-EDCA Stage 2 failures.
-        // forceCurrentCw=true typically means CTS timeout path
-        if (forceCurrentCw)
+        // Distinguish an actual CTS timer expiry from later frame-exchange failures.
+        // forceCurrentCw controls CW handling and is not a failure-reason indicator.
+        if (m_pedcaCtsTimeoutInProgress)
         {
             m_pedcaFailRtsCtsTimeout++;  // TRACE: CTS timeout (AP didn't reply to RTS)
             if (m_lastStage2GapUs >= 0.0) {
@@ -1520,6 +1546,15 @@ QosFrameExchangeManager::ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
 }
 
 void
+QosFrameExchangeManager::CtsTimeout(Ptr<WifiMpdu> rts, const WifiTxVector& txVector)
+{
+    const bool stage2CtsTimeout = m_pedcaStage2Active;
+    m_pedcaCtsTimeoutInProgress = stage2CtsTimeout;
+    FrameExchangeManager::CtsTimeout(rts, txVector);
+    m_pedcaCtsTimeoutInProgress = false;
+}
+
+void
 QosFrameExchangeManager::PedcaPhyTxEndCallback(Ptr<const Packet> pkt)
 {
     // Guard: only fire once (m_pedcaTxEndPending is true only while we are waiting for our DS-CTS)
@@ -1548,8 +1583,76 @@ QosFrameExchangeManager::PedcaPhyTxEndCallback(Ptr<const Packet> pkt)
 void
 QosFrameExchangeManager::PedcaStage2Enter()
 {
+    if (!m_pedcaPending || !m_pedcaEdca)
+    {
+        return;
+    }
     m_pedcaEdca->SetPedcaBypassBackoff(true, m_linkId);
     NotifyChannelReleased(m_pedcaEdca);
+}
+
+void
+QosFrameExchangeManager::PedcaMediumBusy(Time duration)
+{
+    // A busy event after DS-CTS and before this STA starts its initial frame means
+    // that this STA did not initiate the TXOP. RX-start and CCA-busy may both fire
+    // for one signal; clearing m_pedcaPending makes this callback idempotent.
+    if (!m_pedcaPending || m_pedcaStage2Active || !m_pedcaEdca)
+    {
+        return;
+    }
+
+    Ptr<QosTxop> edca = m_pedcaEdca;
+    const double gapUs =
+        (m_pedcaCtsTxEnd > Seconds(0))
+            ? (Simulator::Now() - m_pedcaCtsTxEnd).GetMicroSeconds()
+            : -1.0;
+
+    m_pedcaPending = false;
+    m_pedcaCtsTxEnd = Seconds(0);
+    m_pedcaFailDidNotInitiateTxop++;
+    m_pedcaAttempts.push_back(
+         {Simulator::Now().GetMicroSeconds() - std::max(gapUs, 0.0),
+         gapUs,
+         static_cast<int>(edca->GetBackoffSlots(m_linkId)),
+         "DID_NOT_INITIATE_TXOP"});
+    m_lastStage2GapUs = -1.0;
+    m_lastBackoffSlots = -1;
+
+    constexpr uint32_t VO_DEFAULT_CWMIN = 3;
+    constexpr uint32_t VO_DEFAULT_CWMAX = 7;
+    constexpr uint8_t VO_DEFAULT_AIFSN = 2;
+    edca->SetMinCw(VO_DEFAULT_CWMIN, m_linkId);
+    edca->SetMaxCw(VO_DEFAULT_CWMAX, m_linkId);
+    edca->SetAifsn(VO_DEFAULT_AIFSN, m_linkId);
+
+    const bool canRetryPedca =
+        (m_qsrc >= m_qsrc_threshold) && (m_psrc < m_psrc_limit) &&
+        (m_mac->GetFrameRetryLimit() > m_qsrc_threshold) &&
+        (edca->GetAifsn(m_linkId) > 0);
+
+    if (canRetryPedca)
+    {
+        edca->GeneratePedcaStage1Backoff(m_cwds, m_linkId);
+    }
+    else
+    {
+        ResumePedcaSuspendedACs();
+        edca->GenerateBackoff(m_linkId);
+    }
+
+    if (edca->GetAccessStatus(m_linkId) == Txop::NOT_REQUESTED)
+    {
+        m_channelAccessManager->RequestAccess(edca);
+    }
+
+    std::clog << "[P-EDCA STAGE2 END:DID_NOT_INITIATE_TXOP] t="
+              << Simulator::Now().GetMicroSeconds() << "us"
+              << " busyDuration=" << duration.GetMicroSeconds() << "us"
+              << " gap=" << gapUs << "us"
+              << " PSRC=" << +m_psrc << "/" << +m_psrc_limit
+              << (canRetryPedca ? " -> retry Stage 1" : " -> ordinary EDCA")
+              << std::endl;
 }
 
 void

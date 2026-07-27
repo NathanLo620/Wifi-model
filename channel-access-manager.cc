@@ -213,7 +213,11 @@ ChannelAccessManager::GetTypeId()
                             "The number of remaining backoff slots for the AC with the given index "
                             "reached the threshold set through the NSlotsLeft attribute.",
                             MakeTraceSourceAccessor(&ChannelAccessManager::m_nSlotsLeftCallback),
-                            "ns3::ChannelAccessManager::NSlotsLeftCallback");
+                            "ns3::ChannelAccessManager::NSlotsLeftCallback")
+            .AddTraceSource("MediumBusy",
+                            "The PHY started receiving or sensing an external busy period.",
+                            MakeTraceSourceAccessor(&ChannelAccessManager::m_mediumBusyCallback),
+                            "ns3::Time::TracedCallback");
     return tid;
 }
 
@@ -1065,6 +1069,7 @@ ChannelAccessManager::NotifyRxStartNow(Time duration)
     NS_LOG_DEBUG("rx start for=" << duration);
     UpdateBackoff();
     UpdateLastIdlePeriod();
+    m_mediumBusyCallback(duration);
     m_lastRx.start = Simulator::Now();
     m_lastRx.end = m_lastRx.start + duration;
     m_lastRxReceivedOk = true;
@@ -1120,6 +1125,7 @@ ChannelAccessManager::NotifyCcaBusyStartNow(Time duration,
     NS_LOG_FUNCTION(this << duration << channelType);
     UpdateBackoff();
     UpdateLastIdlePeriod();
+    m_mediumBusyCallback(duration);
     auto lastBusyEndIt = m_lastBusyEnd.find(channelType);
     NS_ASSERT(lastBusyEndIt != m_lastBusyEnd.end());
     Time now = Simulator::Now();

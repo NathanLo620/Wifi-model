@@ -591,6 +591,9 @@ class ChannelAccessManager : public Object
     using NSlotsLeftTracedCallback = TracedCallback<uint8_t, AcIndex, const Time&>;
 
     NSlotsLeftTracedCallback m_nSlotsLeftCallback; //!< traced callback for NSlotsLeft alerts
+
+    /// Fired when this PHY starts receiving or sensing an external busy period.
+    TracedCallback<Time> m_mediumBusyCallback;
 };
 
 /**

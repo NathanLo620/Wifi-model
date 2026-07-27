@@ -48,6 +48,10 @@ class QosFrameExchangeManager : public FrameExchangeManager
     uint32_t GetPedcaFailRtsCollision() const { return m_pedcaFailRtsCollision; }
     uint32_t GetPedcaFailTimingExpired() const { return m_pedcaFailTimingExpired; }
     uint32_t GetPedcaFailDeferral() const { return m_pedcaFailDeferral; }
+    uint32_t GetPedcaFailDidNotInitiateTxop() const
+    {
+        return m_pedcaFailDidNotInitiateTxop;
+    }
 
     /** Set CWds (Stage-1 contention window).  0=immediate, 1=random[0,1], … */
     void SetCwds(uint32_t cwds) { m_cwds = cwds; }
@@ -64,7 +68,7 @@ class QosFrameExchangeManager : public FrameExchangeManager
         double dsCtsEndUs;       //!< Time when DS-CTS TX ended (microseconds)
         double gapUs;            //!< Effective gap from DS-CTS end to TX start (microseconds)
         int    backoffSlots;     //!< Reconstructed backoff slots = (gap-AIFS)/slotTime; -1 if unknown
-        std::string outcome;     //!< SUCCESS / RTS_CTS_TIMEOUT / RTS_COLLISION / DEFERRAL
+        std::string outcome;     //!< SUCCESS / timeout / collision / did-not-initiate outcome
     };
     const std::vector<PedcaAttemptRecord>& GetPedcaAttempts() const { return m_pedcaAttempts; }
 
@@ -132,6 +136,8 @@ class QosFrameExchangeManager : public FrameExchangeManager
 
   protected:
     void DoDispose() override;
+    void SetChannelAccessManager(
+        const Ptr<ChannelAccessManager> channelAccessManager) override;
 
     void ReceiveMpdu(Ptr<const WifiMpdu> mpdu,
                      RxSignalInfo rxSignalInfo,
@@ -155,6 +161,7 @@ class QosFrameExchangeManager : public FrameExchangeManager
                                 Time response) const override;
     void TransmissionSucceeded() override;
     void TransmissionFailed(bool forceCurrentCw = false) override;
+    void CtsTimeout(Ptr<WifiMpdu> rts, const WifiTxVector& txVector) override;
     void ForwardMpduDown(Ptr<WifiMpdu> mpdu, WifiTxVector& txVector) override;
     void ReceivedMacHdr(const WifiMacHeader& macHdr,
                         const WifiTxVector& txVector,
@@ -290,8 +297,15 @@ class QosFrameExchangeManager : public FrameExchangeManager
      */
     void PedcaStage2Enter();
 
+    /**
+     * End the current P-EDCA round if another transmission makes the medium busy
+     * before this station initiates its TXOP.
+     */
+    void PedcaMediumBusy(Time duration);
+
     // P-EDCA Stage 2 collision tracking
-    bool m_pedcaStage2Active{false};  //!< True when in P-EDCA Stage 2 contention
+    bool m_pedcaStage2Active{false};  //!< True after Stage 2 wins access and starts a TXOP
+    bool m_pedcaCtsTimeoutInProgress{false}; //!< True while processing an actual CTS timeout
     TracedCallback<Ptr<const Packet>> m_pedcaTxTrace;      //!< Trace for P-EDCA Stage 2 transmissions
     TracedCallback<Ptr<const Packet>> m_edcaTxTrace;       //!< Trace for all EDCA transmissions
     TracedCallback<Ptr<const Packet>> m_pedcaAttemptTrace;  //!< Trace for P-EDCA Stage 1 attempts (DS-CTS sent)
@@ -302,6 +316,7 @@ class QosFrameExchangeManager : public FrameExchangeManager
     uint32_t m_pedcaFailRtsCollision{0};    //!< RTS collision during Stage 2 (two P-EDCA STAs)
     uint32_t m_pedcaFailTimingExpired{0};   //!< Legacy statistic retained for output compatibility
     uint32_t m_pedcaFailDeferral{0};        //!< P-EDCA deferred (medium busy before DS-CTS)
+    uint32_t m_pedcaFailDidNotInitiateTxop{0}; //!< Another STA obtained a TXOP in Stage 2
     // Event counters
     uint32_t m_dsCtsCount{0};              //!< Number of DS-CTS frames sent
     uint32_t m_stage2EntryCount{0};        //!< Number of times Stage 2 contention entered
