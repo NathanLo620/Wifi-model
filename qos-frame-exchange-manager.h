@@ -61,6 +61,14 @@ class QosFrameExchangeManager : public FrameExchangeManager
     void SetPsrc(uint8_t psrc)  { m_psrc_limit = psrc; }
     uint16_t GetQsrcThreshold() const { return m_qsrc_threshold; }
     uint8_t  GetPsrcLimit()     const { return m_psrc_limit; }
+    /**
+     * Set how many DS-CTS frames a single Stage-1 attempt transmits.
+     *   1 = single DS-CTS, Stage 2 contends after AIFS (legacy behaviour)
+     *   2 = dual DS-CTS a SIFS apart, Stage 2 contends after SIFS (see SendDsCtsFrame)
+     */
+    void SetDsCtsRepeat(uint8_t repeat) { m_dsCtsRepeat = (repeat == 0) ? 1 : repeat; }
+    uint8_t  GetDsCtsRepeat()   const { return m_dsCtsRepeat; }
+    uint32_t GetDsCtsFramesTx() const { return m_dsCtsFramesTx; }
 
     // Per-attempt P-EDCA record for backoff vs failure analysis
     struct PedcaAttemptRecord
@@ -282,12 +290,53 @@ class QosFrameExchangeManager : public FrameExchangeManager
     Time m_pedcaCtsTxEnd{0};  //!< DS-CTS transmission end time for timing verification
 
     // P-EDCA PhyTxEnd trace helpers (zero-delay Stage 2 entry)
-    bool m_pedcaTxEndPending{false};  //!< True while PhyTxEnd is connected waiting for our DS-CTS
     Ptr<QosTxop> m_pedcaEdca;         //!< Saved AC_VO Txop for use inside PedcaPhyTxEndCallback
 
+    // ── Dual DS-CTS (two-layer Stage 1) ──
+    // A single DS-CTS that collides with a legacy RTS is never decoded, so no receiver sets
+    // its NAV and the P-EDCA protection window does not exist.  Because a legacy RTS (52us)
+    // is longer than a DS-CTS (44us), the RTS has already finished by the time a SECOND
+    // DS-CTS goes out a SIFS after the first, so the second one is transmitted into a clean
+    // medium and the NAV is reliably established.
+    uint8_t  m_dsCtsRepeat{2};        //!< DS-CTS frames per Stage-1 attempt (1 = legacy, 2 = dual)
+    uint8_t  m_dsCtsTxRemaining{0};   //!< DS-CTS PhyTxEnd notifications still expected (0 = not in Stage 1)
+    uint32_t m_dsCtsFramesTx{0};      //!< DS-CTS frames actually put on air (m_dsCtsCount counts attempts)
+    // Retained as members because ForwardMpduDown() takes a non-const WifiTxVector& and the
+    // second DS-CTS is transmitted from a scheduled callback, which needs a stable lvalue.
+    WifiMacHeader m_dsCtsHeader;      //!< MAC header of the DS-CTS currently being transmitted
+    WifiTxVector  m_dsCtsTxVector;    //!< TX vector of the DS-CTS currently being transmitted
+
     /**
-     * PhyTxEnd trace callback: fires at the exact moment our DS-CTS finishes TX.
-     * Replaces the polling-loop scheduler so Stage 2 entry has zero delay after CTS TX end.
+     * AIFSN used for Stage-2 contention.  With a dual DS-CTS burst this is 0, so that access is
+     * granted a SIFS after the last DS-CTS and SIFS+backoff(0-7 slots)=[16,79]us stays within
+     * the 81us NAV window.  With a single DS-CTS the legacy AIFSN=2 (AIFS=34us) is kept.
+     *
+     * @return the Stage-2 AIFSN
+     */
+    uint8_t GetPedcaStage2Aifsn() const { return (m_dsCtsRepeat >= 2) ? 0 : 2; }
+
+    /**
+     * @return the TX vector used for every DS-CTS: non-HT OFDM 6 Mb/s, 20 MHz (P-EDCA draft 3.5).
+     */
+    WifiTxVector GetDsCtsTxVector() const;
+
+    /**
+     * @return the airtime of one DS-CTS PPDU (44us for a 14-byte CTS at OFDM 6 Mb/s, 20 MHz).
+     */
+    Time GetDsCtsAirtime() const;
+
+    /**
+     * Build and transmit one DS-CTS carrying the given Duration/ID value.
+     *
+     * @param navDuration the value to place in the Duration field
+     * @return the airtime of the transmitted DS-CTS
+     */
+    Time SendDsCtsFrame(Time navDuration);
+
+    /**
+     * PhyTxEnd trace callback: fires at the exact moment a DS-CTS finishes TX.
+     * Counts down m_dsCtsTxRemaining; schedules the next DS-CTS a SIFS later while frames
+     * remain, and enters Stage 2 once the last one has been transmitted.
      */
     void PedcaPhyTxEndCallback(Ptr<const Packet> pkt);
 

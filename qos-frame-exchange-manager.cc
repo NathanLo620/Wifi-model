@@ -119,7 +119,7 @@ QosFrameExchangeManager::SetWifiPhy(Ptr<WifiPhy> phy)
 {
     FrameExchangeManager::SetWifiPhy(phy);
     // Connect PhyTxEnd trace permanently so PedcaPhyTxEndCallback can detect DS-CTS TX end
-    // without the per-transmission polling loop.  The flag m_pedcaTxEndPending gates activity.
+    // without the per-transmission polling loop.  m_dsCtsTxRemaining gates activity.
     phy->TraceConnectWithoutContext(
         "PhyTxEnd",
         MakeCallback(&QosFrameExchangeManager::PedcaPhyTxEndCallback, this));
@@ -263,6 +263,16 @@ bool
 QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
 {
     NS_LOG_FUNCTION(this << edca << txopDuration);
+
+    // A DS-CTS burst is mid-flight: the medium looks idle during the SIFS gap between the
+    // frames, but transmitting anything now would collide with our own next DS-CTS.  Decline
+    // access; PedcaPhyTxEndCallback drives the burst to completion and enters Stage 2.
+    // Returning false is safe: DoGrantDcfAccess restarts the backoff counter for this EDCAF.
+    if (m_dsCtsTxRemaining > 0)
+    {
+        NS_LOG_DEBUG("P-EDCA: DS-CTS burst in flight, declining channel access");
+        return false;
+    }
 
     if (m_pifsRecoveryEvent.IsPending())
     {
@@ -455,51 +465,42 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                         }
                     }
 
-                    // 2. Construct DS-CTS (CTS-to-Self)
-                    WifiMacHeader ctsHeader;
-                    ctsHeader.SetType(WIFI_MAC_CTL_CTS);
-                    ctsHeader.SetDsNotFrom();
-                    ctsHeader.SetDsNotTo();
-                    ctsHeader.SetNoMoreFragments();
-                    ctsHeader.SetNoRetry();
-                    ctsHeader.SetAddr1(Mac48Address("00:0F:AC:47:43:00")); // P-EDCA fixed RA (per draft)
-                    
-                    // The current P-EDCA draft specifies an 81us DS-CTS Duration field.
-                    // Reserves an 81us contention window:
-                    //   - NAV freezes non-P-EDCA STAs
-                    //   - P-EDCA STAs contend with (CW=7, AIFSN=2) 
-                    Time pedcaWindowDuration = MicroSeconds(81);
-                    ctsHeader.SetDuration(pedcaWindowDuration);
+                    // 2./3. Transmit the first DS-CTS of this Stage-1 attempt.
+                    //
+                    // The last DS-CTS of the burst always carries the 81us P-EDCA window.
+                    // When two DS-CTS are sent, the FIRST one must carry
+                    //   SIFS + ctsAirtime + 81us
+                    // so that a STA which decoded only the first frame ends its NAV at exactly
+                    // the same instant as a STA which decoded only the second one.  NAV is a
+                    // single absolute deadline updated with max() semantics
+                    // (frame-exchange-manager.cc:1331 and channel-access-manager.cc:1344), so
+                    // both frames converge on one expiry rather than stacking.
+                    // Computed at runtime rather than hardcoded (141us at a 44us airtime) so it
+                    // stays correct if the DS-CTS rate or channel width ever changes.
+                    Time ctsAirtime = GetDsCtsAirtime();
+                    Time navLast = MicroSeconds(81);
+                    Time navFirst = (m_dsCtsRepeat >= 2)
+                                        ? (m_phy->GetSifs() + ctsAirtime + navLast)
+                                        : navLast;
 
-                    // 3. Transmit DS-CTS using non-HT OFDM 6 Mbps (per P-EDCA draft 3.5)
-                    // Standard requires: non-HT PPDU, 6 Mb/s, scrambler seed=32
-                    WifiTxVector ctsTxVector;
-                    ctsTxVector.SetMode(WifiMode("OfdmRate6Mbps"));  // non-HT 6 Mbps
-                    ctsTxVector.SetPreambleType(WIFI_PREAMBLE_LONG); // non-HT preamble
-                    ctsTxVector.SetTxPowerLevel(0);
-                    ctsTxVector.SetChannelWidth(20);
+                    SendDsCtsFrame(navFirst);
 
-                    Ptr<WifiMpdu> mpdu = Create<WifiMpdu>(Create<Packet>(), ctsHeader);
+                    // Expect one PhyTxEnd per DS-CTS; the callback counts down and sends the rest.
+                    m_dsCtsTxRemaining = m_dsCtsRepeat;
 
-                    // PHY Busy check moved to deferralRequired block above for robustness
+                    m_dsCtsCount++;  // TRACE: Stage-1 attempts (one per burst, not per frame)
 
-                    ForwardMpduDown(mpdu, ctsTxVector);
-                    
-                    m_dsCtsCount++;  // TRACE: DS-CTS sent count
-                    
-                    // Fire P-EDCA Attempt trace (DS-CTS sent = one P-EDCA attempt)
-                    m_pedcaAttemptTrace(mpdu->GetPacket());
-                    
-                    Time ctsAirtime = m_phy->CalculateTxDuration(mpdu->GetPacketSize(),
-                                                                ctsTxVector,
-                                                                m_phy->GetPhyBand());
+                    // Fire P-EDCA Attempt trace (one Stage-1 attempt, regardless of burst length)
+                    m_pedcaAttemptTrace(Create<Packet>());
+
                     Time ctsTxEnd = Simulator::Now() + ctsAirtime;
-                    
-                    // PSRC++ on DS-CTS transmission (per draft 3.1)
+
+                    // PSRC++ on DS-CTS transmission (per draft 3.1) — once per attempt
                     m_psrc++;
-                    std::clog << "[P-EDCA TIMING] DS-CTS TX end at t=" 
-                              << ctsTxEnd.GetMicroSeconds() << "us (airtime=" 
-                              << ctsAirtime.GetMicroSeconds() << "us) PSRC=" << +m_psrc << std::endl;
+                    std::clog << "[P-EDCA TIMING] DS-CTS 1/" << +m_dsCtsRepeat << " TX end at t="
+                              << ctsTxEnd.GetMicroSeconds() << "us (airtime="
+                              << ctsAirtime.GetMicroSeconds() << "us, NAV field="
+                              << navFirst.GetMicroSeconds() << "us) PSRC=" << +m_psrc << std::endl;
 
                     // 4. Disable THIS STA's non-VO ACs during P-EDCA window
                     // This prevents internal collision from VI/BE/BK on this STA
@@ -523,30 +524,34 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     // We only set it in the callback when we truly begin Stage 2 contention.
                     // This prevents StartTransmission from mistakenly entering Stage 2 during CTS transmission.
                     
-                    // Pre-calculate CTS end time for the callback locally
-                    Time pedcaCtsTxEnd = Simulator::Now() + ctsAirtime;
-                    
                     // CRITICAL: Use m_linkId when setting P-EDCA parameters!
                     // The default SetMinCw(7) only sets linkId=0 which may be wrong.
                     m_edca->SetMinCw(7, m_linkId);
                     m_edca->SetMaxCw(7, m_linkId);
-                    m_edca->SetAifsn(2, m_linkId);
-                    
+                    // NOTE: the Stage-2 AIFSN is applied in PedcaPhyTxEndCallback once the whole
+                    // DS-CTS burst has been transmitted, NOT here.  Applying AIFSN=0 now would
+                    // make the ChannelAccessManager grant access at
+                    // (DS-CTS #1 end + SIFS) -- the exact instant DS-CTS #2 is scheduled for --
+                    // and the two transmissions would race into WifiPhy::Send() together,
+                    // tripping its "!IsStateTx()" assertion.  Keeping the legacy AIFSN during
+                    // the burst pushes any grant past the end of DS-CTS #2.
+
                     // Force reset CW to ensure P-EDCA uses CW=7
                     m_edca->ResetCw(m_linkId);
-                    
-                    /*NS_LOG_DEBUG("P-EDCA: Switched to P-EDCA params on link " << +m_linkId 
+
+                    /*NS_LOG_DEBUG("P-EDCA: Switched to P-EDCA params on link " << +m_linkId
                                  << " (CWmin=7, CWmax=7, AIFSN=2, CW=" << m_edca->GetCw(m_linkId) << ")");*/
 
                     // 6. Connect PhyTxEnd trace for zero-delay Stage 2 entry.
                     //
-                    // PhyTxEnd fires from WifiPhy::TxDone at the EXACT CTS TX end time,
-                    // with no polling delay.  From that moment, Stage 2 timing is:
-                    //   AIFS(34µs) + backoff(0–63µs) = [34, 97]µs from ctsTxEnd.
-                    //   NAV window = 81us -> backoff 0-5 (gap 34-79us) fit theoretically.
-                    //   Backoff 6-7 (gap 88-97us) exceed 81us.
+                    // PhyTxEnd fires from WifiPhy::TxDone at the EXACT TX end of each DS-CTS.
+                    // From the end of the LAST DS-CTS, Stage 2 timing is:
+                    //   dual DS-CTS (AIFSN=0): SIFS(16us) + backoff(0-63us) = [16, 79]us
+                    //       -> every backoff value fits inside the 81us NAV window.
+                    //   single DS-CTS (AIFSN=2): AIFS(34us) + backoff(0-63us) = [34, 97]us
+                    //       -> backoff 6-7 (88/97us) escape the 81us window and can be
+                    //          overtaken by a legacy STA whose NAV has already expired.
                     m_pedcaEdca = m_edca;
-                    m_pedcaTxEndPending = true;  // arm the permanently-connected PhyTxEnd callback
 
                     // Prevent immediate data transmission in this call stack
                     m_edca = nullptr;
@@ -572,12 +577,17 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
 
                          constexpr double PEDCA_NAV_WINDOW_US = 81.0;
 
-                         // Capture per-attempt info (AIFS=34us, slot=9us assumed for OFDM 5GHz)
-                         constexpr double AIFS_US = 34.0;
+                         // Capture per-attempt info (slot=9us assumed for OFDM 5GHz).
+                         // The deferral before backoff is SIFS when Stage 2 runs with AIFSN=0
+                         // (dual DS-CTS) and a full AIFS otherwise, so back out the right one
+                         // to reconstruct the backoff slot count.
                          constexpr double SLOT_US = 9.0;
+                         const double deferralUs =
+                             m_phy->GetSifs().GetMicroSeconds() +
+                             GetPedcaStage2Aifsn() * SLOT_US;
                          m_lastStage2GapUs = gapUs;
-                         m_lastBackoffSlots = (gapUs >= AIFS_US)
-                             ? static_cast<int>((gapUs - AIFS_US) / SLOT_US + 0.5)
+                         m_lastBackoffSlots = (gapUs >= deferralUs)
+                             ? static_cast<int>((gapUs - deferralUs) / SLOT_US + 0.5)
                              : -1;
 
                          // The 81us value is the DS-CTS NAV window, not a deadline for
@@ -605,6 +615,7 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                      // Always clear P-EDCA pending flags when leaving this block (either success or expiry)
                      m_pedcaPending = false;
                      m_pedcaCtsTxEnd = Seconds(0);
+                     m_dsCtsTxRemaining = 0;
                      
                      // CRITICAL FIX: Restore VO default parameters from dot11EDCATable!
                      // Per 802.11 Table 9-155: AC_VO: CWmin=3, CWmax=7, AIFSN=2
@@ -1155,6 +1166,12 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
                       << " PSRC=" << +m_psrc << " QSRC=" << m_qsrc << std::endl;
         }
         
+        // Restore the VO AIFSN *before* the start-condition checks below.  Stage 2 runs with
+        // AIFSN=0 when a dual DS-CTS burst is used, and the "aifsn_nonzero" guard further down
+        // (and in the Stage-1 trigger) would read 0 and silently disable P-EDCA for good.
+        m_edca->SetAifsn(2, m_linkId);
+        m_dsCtsTxRemaining = 0;
+
         // Stage 2 failure: Apply CW expansion using QSRC formula (per spec 5.3)
         // CW[AC_VO] = min(CWmax[AC_VO], 2^QSRC[AC_VO] × (CWmin[AC_VO] + 1) - 1)
         // Use dot11EDCATable values for CWmin/CWmax
@@ -1216,13 +1233,17 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
     {
         // Increment QSRC (Queue Size Retry Counter) for VO failures
         m_qsrc++;
-        std::clog << "[P-EDCA QSRC++] VO transmission failed, QSRC=" << m_qsrc 
+        std::clog << "[P-EDCA QSRC++] VO transmission failed, QSRC=" << m_qsrc
                   << " at t=" << Simulator::Now().GetMicroSeconds() << "us" << std::endl;
-        
+
         // If we were in P-EDCA mode, reset the pending flag
         if (m_pedcaPending)
         {
             m_pedcaPending = false;
+            m_dsCtsTxRemaining = 0;
+            // Stage 2 may have been armed with AIFSN=0 (dual DS-CTS); restore it before the
+            // aifsn_nonzero start condition below is evaluated, otherwise P-EDCA never retriggers.
+            m_edca->SetAifsn(2, m_linkId);
             std::clog << "[P-EDCA RESTORE] Returning to normal EDCA after failure" << std::endl;
         }
 
@@ -1554,26 +1575,98 @@ QosFrameExchangeManager::CtsTimeout(Ptr<WifiMpdu> rts, const WifiTxVector& txVec
     m_pedcaCtsTimeoutInProgress = false;
 }
 
+WifiTxVector
+QosFrameExchangeManager::GetDsCtsTxVector() const
+{
+    // Standard requires: non-HT PPDU, 6 Mb/s, scrambler seed=32 (P-EDCA draft 3.5)
+    WifiTxVector ctsTxVector;
+    ctsTxVector.SetMode(WifiMode("OfdmRate6Mbps"));  // non-HT 6 Mbps
+    ctsTxVector.SetPreambleType(WIFI_PREAMBLE_LONG); // non-HT preamble
+    ctsTxVector.SetTxPowerLevel(0);
+    ctsTxVector.SetChannelWidth(20);
+    return ctsTxVector;
+}
+
+Time
+QosFrameExchangeManager::GetDsCtsAirtime() const
+{
+    auto ctsTxVector = GetDsCtsTxVector();
+    // GetCtsSize() is the 14-byte PSDU (10-byte CTS header + 4-byte FCS).  Using the MPDU
+    // *payload* size here instead would yield 24us rather than the true 44us.
+    return WifiPhy::CalculateTxDuration(GetCtsSize(), ctsTxVector, m_phy->GetPhyBand());
+}
+
+Time
+QosFrameExchangeManager::SendDsCtsFrame(Time navDuration)
+{
+    // Construct DS-CTS (CTS-to-Self).  Kept in members because ForwardMpduDown() takes a
+    // non-const WifiTxVector& and this runs from a scheduled callback for the second frame.
+    m_dsCtsHeader = WifiMacHeader();
+    m_dsCtsHeader.SetType(WIFI_MAC_CTL_CTS);
+    m_dsCtsHeader.SetDsNotFrom();
+    m_dsCtsHeader.SetDsNotTo();
+    m_dsCtsHeader.SetNoMoreFragments();
+    m_dsCtsHeader.SetNoRetry();
+    m_dsCtsHeader.SetAddr1(Mac48Address("00:0F:AC:47:43:00")); // P-EDCA fixed RA (per draft)
+    m_dsCtsHeader.SetDuration(navDuration);
+
+    m_dsCtsTxVector = GetDsCtsTxVector();
+
+    auto mpdu = Create<WifiMpdu>(Create<Packet>(), m_dsCtsHeader);
+
+    // PHY Busy check is done in the deferralRequired block before the first DS-CTS.  The
+    // second DS-CTS is sent unconditionally, like any SIFS-separated control response: its
+    // whole purpose is to establish the NAV even when the first one was destroyed.
+    ForwardMpduDown(mpdu, m_dsCtsTxVector);
+
+    m_dsCtsFramesTx++;
+
+    return WifiPhy::CalculateTxDuration(mpdu->GetSize(), m_dsCtsTxVector, m_phy->GetPhyBand());
+}
+
 void
 QosFrameExchangeManager::PedcaPhyTxEndCallback(Ptr<const Packet> pkt)
 {
-    // Guard: only fire once (m_pedcaTxEndPending is true only while we are waiting for our DS-CTS)
-    if (!m_pedcaTxEndPending)
+    // Guard: non-zero only while we are waiting for the DS-CTS burst of a Stage-1 attempt.
+    // Subsequent PhyTxEnd firings (from data/RTS/etc.) return immediately.
+    if (m_dsCtsTxRemaining == 0)
     {
         return;
     }
-    // Disarm: subsequent PhyTxEnd firings (from data/RTS/etc.) will return immediately
-    m_pedcaTxEndPending = false;
 
+    if (--m_dsCtsTxRemaining > 0)
+    {
+        // More DS-CTS to go: send the next one a SIFS after this one finished.  Driving this
+        // off the real PhyTxEnd rather than arithmetic keeps it correct regardless of airtime.
+        std::clog << "[P-EDCA TIMING] DS-CTS TX end at t="
+                  << Simulator::Now().GetMicroSeconds() << "us, next DS-CTS in SIFS ("
+                  << m_phy->GetSifs().GetMicroSeconds() << "us)" << std::endl;
+
+        Simulator::Schedule(m_phy->GetSifs(),
+                            &QosFrameExchangeManager::SendDsCtsFrame,
+                            this,
+                            MicroSeconds(81));
+        return;
+    }
+
+    // Last DS-CTS of the burst is done -> Stage 2 starts from THIS instant.
     // Simulator::Now() == m_pedcaCtsTxEnd exactly (fired from WifiPhy::TxDone)
     uint32_t pre = m_pedcaEdca->GetBackoffSlots(m_linkId);
     std::clog << "[P-EDCA STAGE2 ENTER] t=" << Simulator::Now().GetMicroSeconds()
-              << "us (= CTS TX end) pre-regen backoff=" << pre
+              << "us (= last of " << +m_dsCtsRepeat << " DS-CTS TX end) pre-regen backoff=" << pre
               << " slots (CW=" << m_pedcaEdca->GetCw(m_linkId) << ")" << std::endl;
 
     m_stage2EntryCount++;
     m_pedcaPending   = true;
     m_pedcaCtsTxEnd  = Simulator::Now();  // exact TX end, no polling offset
+
+    // Apply the Stage-2 AIFSN now that the burst is over.  AIFSN=0 (dual DS-CTS) makes
+    // ChannelAccessManager grant access one SIFS after this instant rather than one AIFS:
+    // GetBackoffStartFor() evaluates GetAccessGrantStart() + aifsn*slot and
+    // GetAccessGrantStart() already includes a SIFS (channel-access-manager.cc:596).
+    // That is what keeps SIFS+backoff = [16,79]us inside the 81us NAV window.
+    // It must be set before PedcaStage2Enter -> NotifyChannelReleased -> RequestAccess runs.
+    m_pedcaEdca->SetAifsn(GetPedcaStage2Aifsn(), m_linkId);
 
     // Defer Stage 2 entry out of the WifiPhy::TxDone call stack to avoid re-entrant
     // PHY/MAC state machine calls.  ScheduleNow preserves the exact simulation time.
@@ -1610,6 +1703,7 @@ QosFrameExchangeManager::PedcaMediumBusy(Time duration)
 
     m_pedcaPending = false;
     m_pedcaCtsTxEnd = Seconds(0);
+    m_dsCtsTxRemaining = 0;
     m_pedcaFailDidNotInitiateTxop++;
     m_pedcaAttempts.push_back(
          {Simulator::Now().GetMicroSeconds() - std::max(gapUs, 0.0),
