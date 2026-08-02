@@ -13,6 +13,7 @@
 #include "channel-access-manager.h"
 #include "frame-exchange-manager.h"
 #include "mgt-action-headers.h"
+#include "qos-frame-exchange-manager.h"
 #include "qos-txop.h"
 #include "snr-tag.h"
 #include "wifi-assoc-manager.h"
@@ -1721,6 +1722,63 @@ StaWifiMac::RecordOperations(const MgtFrameType& frame, const Mac48Address& from
 }
 
 void
+StaWifiMac::ApplyPedcaParameters(const std::optional<PedcaParameterSet>& parameterSet,
+                                 uint8_t linkId)
+{
+    if (!parameterSet.has_value())
+    {
+        return;
+    }
+
+    // m_aid is read directly rather than through GetAssociationId(), which asserts
+    // IsAssociated(): this runs while the association response is still being processed, at
+    // which point m_aid has been assigned but the state has not yet moved to ASSOCIATED.
+    // Before association m_aid is 0, which never matches a real AID.
+    const auto entry = parameterSet->GetEntryFor(m_aid);
+    if (!entry.has_value())
+    {
+        return;
+    }
+
+    auto qosFem = DynamicCast<QosFrameExchangeManager>(GetFrameExchangeManager(linkId));
+    if (!qosFem)
+    {
+        return;
+    }
+
+    // QosFrameExchangeManager raises the MAC frame retry limit to exceed the QSRC threshold
+    // and never lowers it again, which would silently change retransmission behaviour for
+    // every access category. Keep the advertised threshold below the limit instead.
+    auto qsrcThreshold = static_cast<uint16_t>(entry->qsrcThreshold);
+    if (const auto retryLimit = GetFrameRetryLimit(); qsrcThreshold >= retryLimit)
+    {
+        std::clog << "[P-EDCA PARAM CLAMP] STA=" << GetAddress() << " aid=" << m_aid
+                  << " qsrc=" << qsrcThreshold << " >= FrameRetryLimit=" << retryLimit
+                  << ", clamped to " << (retryLimit - 1) << std::endl;
+        qsrcThreshold = static_cast<uint16_t>(retryLimit - 1);
+    }
+
+    const bool changed = qosFem->GetCwds() != entry->cwds ||
+                         qosFem->GetQsrcThreshold() != qsrcThreshold ||
+                         qosFem->GetPsrcLimit() != entry->psrcLimit;
+    if (!changed)
+    {
+        // Every beacon re-advertises the table; rewriting unchanged values would keep
+        // resetting the sender's state for no reason.
+        return;
+    }
+
+    qosFem->SetCwds(entry->cwds);
+    qosFem->SetQsrc(qsrcThreshold);
+    qosFem->SetPsrc(entry->psrcLimit);
+
+    std::clog << "[P-EDCA PARAM APPLY] t=" << Simulator::Now().GetMicroSeconds()
+              << "us STA=" << GetAddress() << " aid=" << m_aid
+              << " uc=" << +parameterSet->GetUpdateCount() << " cwds=" << +entry->cwds
+              << " qsrc=" << qsrcThreshold << " psrc=" << +entry->psrcLimit << std::endl;
+}
+
+void
 StaWifiMac::ApplyOperationalSettings(const MgtFrameType& frame,
                                      const Mac48Address& apAddr,
                                      const Mac48Address& bssid,
@@ -1804,6 +1862,11 @@ StaWifiMac::ApplyOperationalSettings(const MgtFrameType& frame,
                                edcaParameters->GetVoAifsn(),
                                32 * MicroSeconds(edcaParameters->GetVoTxopLimit())},
                               linkId);
+        }
+
+        if (GetPedcaSupported())
+        {
+            ApplyPedcaParameters(frame.template Get<PedcaParameterSet>(), linkId);
         }
 
         if (GetHtSupported(linkId))

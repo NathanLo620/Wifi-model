@@ -273,6 +273,14 @@ class WifiMacHeader : public Header
      */
     void SetQosQueueSize(uint8_t size);
     /**
+     * Set the P-EDCA Low Latency Indication (LLI) bit, i.e. the MSB of the Queue Size
+     * subfield of the QoS Control field. A P-EDCA station sets it on an AC_VO frame whose
+     * head-of-line age has passed a fraction of the delay bound, so that the AP learns
+     * which stations are running out of delay budget. The Queue Size subfield is
+     * correspondingly reduced to 7 bits; the frame length is unchanged.
+     */
+    void SetQosLli();
+    /**
      * Set the Mesh Control Present flag for the QoS header.
      */
     void SetQosMeshControlPresent();
@@ -609,6 +617,20 @@ class WifiMacHeader : public Header
      * @return the value of the Queue Size subfield
      */
     uint8_t GetQosQueueSize() const;
+    /**
+     * Get the Queue Size subfield with the P-EDCA LLI bit masked off. Use this instead of
+     * GetQosQueueSize() wherever the sender may have set the LLI bit (see SetQosLli()).
+     *
+     * @return the value of the Queue Size subfield, restricted to its lower 7 bits
+     */
+    uint8_t GetQosQueueSize7() const;
+    /**
+     * Get the P-EDCA Low Latency Indication (LLI) bit, i.e. the MSB of the Queue Size
+     * subfield of the QoS Control field.
+     *
+     * @return whether the LLI bit is set
+     */
+    bool GetQosLli() const;
     /**
      * Return the size of the WifiMacHeader in octets.
      * GetSerializedSize calls this function.

@@ -49,8 +49,51 @@ FrameExchangeManager::GetTypeId()
                           "preceded by protection mechanisms.",
                           BooleanValue(true),
                           MakeBooleanAccessor(&FrameExchangeManager::m_protectedIfResponded),
-                          MakeBooleanChecker());
+                          MakeBooleanChecker())
+            .AddAttribute("DsCtsBurstGap",
+                          "Inter-arrival gap above which a decoded P-EDCA DS-CTS is counted as "
+                          "starting a new Stage-1 burst rather than continuing the current one. "
+                          "In-burst spacing is SIFS plus the DS-CTS airtime (about 60 us).",
+                          TimeValue(MicroSeconds(100)),
+                          MakeTimeAccessor(&FrameExchangeManager::m_dsCtsBurstGap),
+                          MakeTimeChecker())
+            .AddTraceSource("DsCtsRx",
+                            "A P-EDCA DS-CTS frame was decoded by this station",
+                            MakeTraceSourceAccessor(&FrameExchangeManager::m_dsCtsRxTrace),
+                            "ns3::Time::TracedCallback");
     return tid;
+}
+
+const Mac48Address&
+FrameExchangeManager::GetDsCtsAddress()
+{
+    static const Mac48Address dsCtsAddress("00:0F:AC:47:43:00");
+    return dsCtsAddress;
+}
+
+uint32_t
+FrameExchangeManager::GetDsCtsRxCount() const
+{
+    return m_dsCtsRxCount;
+}
+
+uint32_t
+FrameExchangeManager::GetDsCtsBurstRxCount() const
+{
+    return m_dsCtsBurstRxCount;
+}
+
+void
+FrameExchangeManager::NotifyDsCtsRx()
+{
+    const auto now = Simulator::Now();
+    if (m_lastDsCtsRxTime.IsZero() || (now - m_lastDsCtsRxTime) > m_dsCtsBurstGap)
+    {
+        m_dsCtsBurstRxCount++;
+    }
+    m_lastDsCtsRxTime = now;
+    m_dsCtsRxCount++;
+    m_dsCtsRxTrace(now);
 }
 
 FrameExchangeManager::FrameExchangeManager()
@@ -1299,6 +1342,16 @@ FrameExchangeManager::PostProcessFrame(Ptr<const WifiPsdu> psdu, const WifiTxVec
 {
     NS_LOG_FUNCTION(this << psdu << txVector);
 
+    // Count every decoded P-EDCA DS-CTS here, not in the DS-CTS branch of UpdateNav(): that
+    // branch only runs when the frame advances the NAV, and dual DS-CTS makes both frames of
+    // a burst expire the NAV at the same instant, so the second one would never be counted.
+    // PostProcessFrame() also runs exactly once per received PSDU, unlike UpdateNav().
+    if (const auto& hdr = psdu->GetHeader(0);
+        hdr.IsCts() && hdr.GetAddr1() == GetDsCtsAddress())
+    {
+        NotifyDsCtsRx();
+    }
+
     UpdateNav(psdu->GetHeader(0), txVector);
 }
 
@@ -1334,7 +1387,7 @@ FrameExchangeManager::UpdateNav(const WifiMacHeader& hdr,
         NS_LOG_DEBUG("Updated NAV=" << m_navEnd);
         // Remember DS-CTS ownership so the P-EDCA Stage-2 RTS can be answered
         // inside the protected window. This does not alter normal EDCA NAV handling.
-        if (hdr.IsCts() && hdr.GetAddr1() == Mac48Address("00:0F:AC:47:43:00"))
+        if (hdr.IsCts() && hdr.GetAddr1() == GetDsCtsAddress())
         {
             m_navEndFromDsCts = navEnd;
         }

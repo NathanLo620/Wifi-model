@@ -413,6 +413,15 @@ WifiMacHeader::SetQosQueueSize(uint8_t size)
 }
 
 void
+WifiMacHeader::SetQosLli()
+{
+    // Bit 15 of the QoS Control field, i.e. the MSB of the Queue Size octet. Callers must
+    // have capped the queue size to 7 bits first, otherwise the special value 254 aliases
+    // to 126 plus a phantom LLI.
+    m_qosStuff |= 0x80;
+}
+
+void
 WifiMacHeader::SetQosMeshControlPresent()
 {
     // Mark bit 0 of this variable instead of bit 8, since m_qosStuff is
@@ -907,6 +916,20 @@ WifiMacHeader::GetQosQueueSize() const
 {
     NS_ASSERT(m_qosEosp == 1);
     return m_qosStuff;
+}
+
+uint8_t
+WifiMacHeader::GetQosQueueSize7() const
+{
+    NS_ASSERT(m_qosEosp == 1);
+    return m_qosStuff & 0x7f;
+}
+
+bool
+WifiMacHeader::GetQosLli() const
+{
+    NS_ASSERT(m_qosEosp == 1);
+    return (m_qosStuff & 0x80) != 0;
 }
 
 uint16_t

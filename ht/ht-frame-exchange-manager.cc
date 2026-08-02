@@ -1334,8 +1334,9 @@ HtFrameExchangeManager::FinalizeMacHeader(Ptr<const WifiPsdu> psdu)
                         edca->GetQosQueueSize(tid, mpdu->GetOriginal()->GetHeader().GetAddr1());
                 }
 
-                hdr.SetQosEosp();
-                hdr.SetQosQueueSize(queueSizeForTid[tid].value());
+                // This, not QosFrameExchangeManager::ForwardMpduDown(), is the queue-size
+                // write point for HT/HE/EHT, so the P-EDCA LLI bit has to be set here too.
+                SetQueueSizeAndPedcaLli(hdr, mpdu, queueSizeForTid[tid].value());
             }
 
             if (m_mac->GetTypeOfStation() == AP && m_apMac->UseGcr(hdr) &&

@@ -75,8 +75,69 @@ QosFrameExchangeManager::GetTypeId()
                 "non-zero TXOP limit when a single frame exchange is protected",
                 TimeValue(Time(0)),
                 MakeTimeAccessor(&QosFrameExchangeManager::m_singleExchangeProtectionSurplus),
-                MakeTimeChecker());
+                MakeTimeChecker())
+            .AddAttribute("PedcaLliDelayBound",
+                          "AC_VO delay budget against which the P-EDCA Low Latency Indication "
+                          "trigger is measured",
+                          TimeValue(MilliSeconds(10)),
+                          MakeTimeAccessor(&QosFrameExchangeManager::m_lliDelayBound),
+                          MakeTimeChecker())
+            .AddAttribute("PedcaLliFraction",
+                          "Fraction of PedcaLliDelayBound beyond which the head-of-line age of an "
+                          "AC_VO frame sets the P-EDCA Low Latency Indication bit",
+                          DoubleValue(0.7),
+                          MakeDoubleAccessor(&QosFrameExchangeManager::m_lliFraction),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("PedcaResetPsrcOnLimitChange",
+                          "Reset the PSRC counter when dot11PEDCAConsecutiveAttempt is changed. "
+                          "False (the spec-faithful default) means PSRC is only cleared by a "
+                          "successful VO transmission, so lowering the limit below a station's "
+                          "live PSRC temporarily locks it out of P-EDCA.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&QosFrameExchangeManager::m_resetPsrcOnLimitChange),
+                          MakeBooleanChecker());
     return tid;
+}
+
+void
+QosFrameExchangeManager::SetPsrc(uint8_t psrc)
+{
+    if (psrc == m_psrc_limit)
+    {
+        return;
+    }
+    m_psrc_limit = psrc;
+    if (m_resetPsrcOnLimitChange)
+    {
+        m_psrc = 0;
+    }
+}
+
+uint32_t
+QosFrameExchangeManager::GetLliRxCount(Mac48Address addr) const
+{
+    const auto it = m_lliRxCountByAddr.find(addr);
+    return (it == m_lliRxCountByAddr.end()) ? 0 : it->second;
+}
+
+void
+QosFrameExchangeManager::SetQueueSizeAndPedcaLli(WifiMacHeader& hdr,
+                                                 Ptr<const WifiMpdu> mpdu,
+                                                 uint8_t queueSize)
+{
+    hdr.SetQosEosp();
+    // 7-bit cap for every station, not just P-EDCA ones: the LLI bit lives in the MSB of
+    // this octet, so an uncapped 254 would read as 126 plus a phantom LLI at a P-EDCA AP.
+    hdr.SetQosQueueSize(std::min<uint8_t>(queueSize, 127));
+
+    if (m_mac->GetPedcaSupported() && QosUtilsMapTidToAc(hdr.GetQosTid()) == AC_VO)
+    {
+        const auto age = Simulator::Now() - mpdu->GetTimestamp();
+        if (age > m_lliFraction * m_lliDelayBound)
+        {
+            hdr.SetQosLli();
+        }
+    }
 }
 
 QosFrameExchangeManager::QosFrameExchangeManager()
@@ -1043,8 +1104,9 @@ QosFrameExchangeManager::ForwardMpduDown(Ptr<WifiMpdu> mpdu, WifiTxVector& txVec
         (m_setQosQueueSize || hdr.IsQosEosp()))
     {
         uint8_t tid = hdr.GetQosTid();
-        hdr.SetQosEosp();
-        hdr.SetQosQueueSize(
+        SetQueueSizeAndPedcaLli(
+            hdr,
+            mpdu,
             m_mac->GetQosTxop(tid)->GetQosQueueSize(tid,
                                                     mpdu->GetOriginal()->GetHeader().GetAddr1()));
     }
@@ -1402,12 +1464,25 @@ QosFrameExchangeManager::PreProcessFrame(Ptr<const WifiPsdu> psdu, const WifiTxV
 
             if (hdr.IsQosData() && hdr.IsQosEosp())
             {
+                const auto from = mpdu->GetOriginal()->GetHeader().GetAddr2();
+                auto bufferStatus = hdr.GetQosQueueSize();
+
+                // With P-EDCA the MSB of the Queue Size octet carries the Low Latency
+                // Indication, so it must be counted and then masked off before the value is
+                // stored as a buffer status report.
+                if (m_mac->GetPedcaSupported() || (m_apMac && m_apMac->GetPedcaControl()))
+                {
+                    if (hdr.GetQosLli())
+                    {
+                        m_lliRxCount++;
+                        m_lliRxCountByAddr[from]++;
+                    }
+                    bufferStatus = hdr.GetQosQueueSize7();
+                }
+
                 NS_LOG_DEBUG("Station " << hdr.GetAddr2() << " reported a buffer status of "
-                                        << +hdr.GetQosQueueSize()
-                                        << " for tid=" << +hdr.GetQosTid());
-                m_apMac->SetBufferStatus(hdr.GetQosTid(),
-                                         mpdu->GetOriginal()->GetHeader().GetAddr2(),
-                                         hdr.GetQosQueueSize());
+                                        << +bufferStatus << " for tid=" << +hdr.GetQosTid());
+                m_apMac->SetBufferStatus(hdr.GetQosTid(), from, bufferStatus);
             }
         }
     }
@@ -1607,7 +1682,7 @@ QosFrameExchangeManager::SendDsCtsFrame(Time navDuration)
     m_dsCtsHeader.SetDsNotTo();
     m_dsCtsHeader.SetNoMoreFragments();
     m_dsCtsHeader.SetNoRetry();
-    m_dsCtsHeader.SetAddr1(Mac48Address("00:0F:AC:47:43:00")); // P-EDCA fixed RA (per draft)
+    m_dsCtsHeader.SetAddr1(GetDsCtsAddress()); // P-EDCA fixed RA (per draft)
     m_dsCtsHeader.SetDuration(navDuration);
 
     m_dsCtsTxVector = GetDsCtsTxVector();

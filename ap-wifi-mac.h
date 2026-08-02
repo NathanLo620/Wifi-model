@@ -180,6 +180,42 @@ class ApWifiMac : public WifiMac
      */
     uint8_t GetMaxBufferStatus(Mac48Address address) const;
 
+    /// The P-EDCA parameter triple advertised to one station.
+    using PedcaTheta = ns3::PedcaTheta;
+
+    /**
+     * Whether this AP advertises and adaptively controls the BSS-wide P-EDCA parameter table.
+     * This is deliberately distinct from WifiMac::GetPedcaSupported(), which would instead
+     * turn the AP itself into a P-EDCA (DS-CTS) sender.
+     *
+     * @return whether P-EDCA control is enabled on this AP
+     */
+    bool GetPedcaControl() const;
+
+    /**
+     * Replace the whole per-AID P-EDCA parameter table and bump the Update Count. The count
+     * is incremented on every call, whether or not any value actually changed, so it means
+     * "n-th table push" rather than "n-th change".
+     *
+     * @param thetaByAid the new parameter table, keyed by association ID
+     */
+    void SetPedcaParametersBulk(const std::map<uint16_t, PedcaTheta>& thetaByAid);
+
+    /**
+     * Look up the parameters currently advertised to one station.
+     *
+     * @param aid the association ID to look up
+     * @return the parameters for that AID, or the P-EDCA defaults if it has none yet
+     */
+    PedcaTheta GetPedcaParametersFor(uint16_t aid) const;
+
+    /**
+     * Build the P-EDCA Parameter Set information element from the current table.
+     *
+     * @return the information element to embed in beacons and responses
+     */
+    PedcaParameterSet GetPedcaParameterSet() const;
+
     /**
      * Return whether GCR is used to transmit a packet.
      *
@@ -635,6 +671,9 @@ class ApWifiMac : public WifiMac
     bool m_enableNonErpProtection; //!< Flag whether protection mechanism is used or not when
                                    //!< non-ERP STAs are present within the BSS
     Time m_bsrLifetime;            //!< Lifetime of Buffer Status Reports
+    bool m_pedcaControl{false};    //!< Flag whether the AP controls the P-EDCA parameter table
+    uint8_t m_pedcaUpdateCount{0}; //!< Number of P-EDCA parameter table pushes, wraps at 256
+    std::map<uint16_t, PedcaTheta> m_pedcaThetaByAid; //!< P-EDCA parameters, keyed by AID
     /// transition timeout events running for EMLSR clients
     std::map<Mac48Address, EventId> m_transitionTimeoutEvents;
     uint8_t m_grpAddrBuIndicExp; //!< Group Addressed BU Indication Exponent of EHT Operation IE

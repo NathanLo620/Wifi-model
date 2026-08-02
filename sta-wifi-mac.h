@@ -487,6 +487,18 @@ class StaWifiMac : public WifiMac
                                   uint8_t linkId);
 
     /**
+     * Apply the row of a received P-EDCA Parameter Set that is addressed to this station, if
+     * the element is present and contains one. Called for every Beacon, Probe Response and
+     * Association Response, so it only writes the frame exchange manager when a value has
+     * actually changed.
+     *
+     * @param parameterSet the P-EDCA Parameter Set element carried by the management frame
+     * @param linkId ID of the link the management frame was received over
+     */
+    void ApplyPedcaParameters(const std::optional<PedcaParameterSet>& parameterSet,
+                              uint8_t linkId);
+
+    /**
      * Get the (Re)Association Request frame to send on a given link. The returned frame
      * never includes a Multi-Link Element.
      *

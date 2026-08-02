@@ -222,6 +222,8 @@ typedef uint8_t WifiInformationElementId;
 // TODO Add 222 to 241. See Table 9-92 of 802.11-2020
 #define IE_FRAGMENT ((WifiInformationElementId)242)
 // 243 to 254 are reserved
+// Non-standard: adaptive P-EDCA parameter table, taken from the reserved 243-254 range
+#define IE_PEDCA_PARAMETER_SET ((WifiInformationElementId)250)
 #define IE_EXTENSION ((WifiInformationElementId)255)
 
 #define IE_EXT_HE_CAPABILITIES ((WifiInformationElementId)35)

@@ -11,6 +11,7 @@
 
 #include "frame-exchange-manager.h"
 
+#include <map>
 #include <optional>
 #include <vector>
 #include <string>
@@ -57,10 +58,36 @@ class QosFrameExchangeManager : public FrameExchangeManager
     void SetCwds(uint32_t cwds) { m_cwds = cwds; }
     /** Set dot11PEDCARetryThreshold (QSRC must reach this value to trigger P-EDCA). */
     void SetQsrc(uint16_t qsrc) { m_qsrc_threshold = qsrc; }
-    /** Set dot11PEDCAConsecutiveAttempt (max consecutive P-EDCA attempts per QSRC cycle). */
-    void SetPsrc(uint8_t psrc)  { m_psrc_limit = psrc; }
+    /**
+     * Set dot11PEDCAConsecutiveAttempt (max consecutive P-EDCA attempts per QSRC cycle).
+     *
+     * Idempotent, because an adaptive controller re-advertises the same value in every
+     * beacon. Note that PSRC itself is sticky: it is only cleared on a successful VO
+     * transmission, so lowering the limit below the station's live PSRC counter locks it
+     * out of P-EDCA until then. Set PedcaResetPsrcOnLimitChange to clear PSRC instead.
+     *
+     * @param psrc the new dot11PEDCAConsecutiveAttempt value
+     */
+    void SetPsrc(uint8_t psrc);
+    /** @return CWds, the Stage-1 contention window */
+    uint32_t GetCwds() const { return m_cwds; }
     uint16_t GetQsrcThreshold() const { return m_qsrc_threshold; }
     uint8_t  GetPsrcLimit()     const { return m_psrc_limit; }
+
+    /**
+     * Number of received frames that carried the P-EDCA Low Latency Indication bit.
+     * Only meaningful at an AP with PedcaControl (or PedcaSupported) enabled.
+     *
+     * @return the cumulative LLI count across all stations
+     */
+    uint32_t GetLliRxCount() const { return m_lliRxCount; }
+    /**
+     * Number of LLI-marked frames received from one station.
+     *
+     * @param addr the transmitter address to look up
+     * @return the cumulative LLI count for that station, 0 if it never sent one
+     */
+    uint32_t GetLliRxCount(Mac48Address addr) const;
     /**
      * Set how many DS-CTS frames a single Stage-1 attempt transmits.
      *   1 = single DS-CTS, Stage 2 contends after AIFS (legacy behaviour)
@@ -237,6 +264,21 @@ class QosFrameExchangeManager : public FrameExchangeManager
      */
     virtual void ClearTxopHolderIfNeeded();
 
+    /**
+     * Write the Queue Size subfield of a QoS Data frame about to be transmitted, and set the
+     * P-EDCA Low Latency Indication bit if this is a P-EDCA station sending an AC_VO frame
+     * that has already spent more than PedcaLliFraction of PedcaLliDelayBound in the queue.
+     *
+     * The queue size is capped to 7 bits for *every* station, P-EDCA or not: the LLI bit
+     * occupies the MSB of the same octet, so an uncapped special value of 254 ("more than
+     * 64768 octets") would be read by a P-EDCA-aware AP as 126 plus a phantom LLI.
+     *
+     * @param hdr the header being finalized (modified in place)
+     * @param mpdu the MPDU the header belongs to, used for its enqueue timestamp
+     * @param queueSize the queue size to report, in units of 256 octets
+     */
+    void SetQueueSizeAndPedcaLli(WifiMacHeader& hdr, Ptr<const WifiMpdu> mpdu, uint8_t queueSize);
+
     Ptr<QosTxop> m_edca;                      //!< the EDCAF that gained channel access
     std::optional<Mac48Address> m_txopHolder; //!< MAC address of the TXOP holder
     bool m_setQosQueueSize;                   /**< whether to set the Queue Size subfield of the
@@ -285,7 +327,15 @@ class QosFrameExchangeManager : public FrameExchangeManager
     // or dynamically from AP via future signalling).  Defaults match 802.11be draft D1.1.
     uint16_t m_qsrc_threshold{2};   //!< dot11PEDCARetryThreshold   (QSRC must reach this to trigger P-EDCA)
     uint8_t  m_psrc_limit{1};       //!< dot11PEDCAConsecutiveAttempt (max consecutive P-EDCA attempts)
-    
+
+    // ── Adaptive P-EDCA feedback: Low Latency Indication (LLI) ──
+    Time   m_lliDelayBound{MilliSeconds(10)}; //!< AC_VO delay budget the LLI trigger is measured against
+    double m_lliFraction{0.7};                //!< fraction of the budget beyond which HOL age sets LLI
+    bool   m_resetPsrcOnLimitChange{false};   //!< whether SetPsrc() also clears the PSRC counter
+    uint32_t m_lliRxCount{0};                 //!< LLI-marked frames received (AP side)
+    std::map<Mac48Address, uint32_t> m_lliRxCountByAddr; //!< LLI-marked frames received, per station
+
+
     // P-EDCA timing tracking for verification
     Time m_pedcaCtsTxEnd{0};  //!< DS-CTS transmission end time for timing verification
 

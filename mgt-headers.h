@@ -14,6 +14,7 @@
 #include "capability-information.h"
 #include "edca-parameter-set.h"
 #include "extended-capabilities.h"
+#include "pedca-parameter-set.h"
 #include "reduced-neighbor-report.h"
 #include "ssid.h"
 #include "status-code.h"
@@ -78,6 +79,17 @@ struct CanBeInPerStaProfile<Ssid> : std::false_type
 {
 };
 
+/**
+ * @copydoc CanBeInPerStaProfile
+ *
+ * The P-EDCA Parameter Set is a per-link, AID-indexed table that a station only ever reads
+ * from the frame carrying it, so there is no reason to duplicate it into a Per-STA Profile.
+ */
+template <>
+struct CanBeInPerStaProfile<PedcaParameterSet> : std::false_type
+{
+};
+
 /// List of Information Elements included in Probe Request frames
 using ProbeRequestElems = std::tuple<Ssid,
                                      SupportedRates,
@@ -111,6 +123,7 @@ using ProbeResponseElems = std::tuple<Ssid,
                                       std::optional<MultiLinkElement>,
                                       std::optional<EhtCapabilities>,
                                       std::optional<EhtOperation>,
+                                      std::optional<PedcaParameterSet>,
                                       std::vector<TidToLinkMapping>>;
 
 /// List of Information Elements included in Association Request frames
@@ -142,6 +155,7 @@ using AssocResponseElems = std::tuple<SupportedRates,
                                       std::optional<MultiLinkElement>,
                                       std::optional<EhtCapabilities>,
                                       std::optional<EhtOperation>,
+                                      std::optional<PedcaParameterSet>,
                                       std::vector<TidToLinkMapping>>;
 
 /**

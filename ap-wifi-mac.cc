@@ -105,6 +105,17 @@ ApWifiMac::GetTypeId()
                           TimeValue(MilliSeconds(20)),
                           MakeTimeAccessor(&ApWifiMac::m_bsrLifetime),
                           MakeTimeChecker())
+            .AddAttribute("PedcaControl",
+                          "Advertise and adaptively control the BSS-wide P-EDCA parameter table "
+                          "without this AP acting as a P-EDCA sender itself. Enabling it turns on "
+                          "the P-EDCA Parameter Set element in beacons and responses plus the "
+                          "buffer-status and low-latency-indication accounting the controller "
+                          "reads. This is deliberately distinct from WifiMac::PedcaSupported: "
+                          "setting that one on an AP would run its own VO management frames "
+                          "through the P-EDCA sender and poison the advertised EDCA parameters.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&ApWifiMac::m_pedcaControl),
+                          MakeBooleanChecker())
             .AddAttribute(
                 "CwMinsForSta",
                 "The CW min values that the AP advertises in EDCA Parameter Set elements and the "
@@ -1236,6 +1247,10 @@ ApWifiMac::GetProbeRespProfile(uint8_t linkId) const
     {
         probe.Get<EdcaParameterSet>() = GetEdcaParameterSet(linkId);
     }
+    if (GetPedcaSupported() || m_pedcaControl)
+    {
+        probe.Get<PedcaParameterSet>() = GetPedcaParameterSet();
+    }
     if (GetHtSupported(linkId))
     {
         probe.Get<ExtendedCapabilities>() = GetExtendedCapabilities();
@@ -1331,6 +1346,12 @@ ApWifiMac::GetAssocResp(Mac48Address to, uint8_t linkId)
     if (GetQosSupported())
     {
         assoc.Get<EdcaParameterSet>() = GetEdcaParameterSet(linkId);
+    }
+    if (GetPedcaSupported() || m_pedcaControl)
+    {
+        // Carried in the association response as well as in beacons, so a station starts out
+        // with the current parameters instead of waiting up to a full beacon interval.
+        assoc.Get<PedcaParameterSet>() = GetPedcaParameterSet();
     }
     if (GetHtSupported(linkId))
     {
@@ -1580,6 +1601,10 @@ ApWifiMac::SendOneBeacon(uint8_t linkId)
     if (GetQosSupported())
     {
         beacon.Get<EdcaParameterSet>() = GetEdcaParameterSet(linkId);
+    }
+    if (GetPedcaSupported() || m_pedcaControl)
+    {
+        beacon.Get<PedcaParameterSet>() = GetPedcaParameterSet();
     }
     if (GetHtSupported(linkId))
     {
@@ -2767,6 +2792,58 @@ ApWifiMac::GetMaxBufferStatus(Mac48Address address) const
         return maxSize;
     }
     return 255;
+}
+
+bool
+ApWifiMac::GetPedcaControl() const
+{
+    return m_pedcaControl;
+}
+
+void
+ApWifiMac::SetPedcaParametersBulk(const std::map<uint16_t, PedcaTheta>& thetaByAid)
+{
+    NS_LOG_FUNCTION(this << thetaByAid.size());
+
+    m_pedcaThetaByAid.clear();
+    for (const auto& [aid, theta] : thetaByAid)
+    {
+        PedcaTheta clamped;
+        clamped.cwds = std::min<uint8_t>(theta.cwds, PEDCA_CWDS_MAX);
+        clamped.qsrcThreshold = std::min<uint8_t>(theta.qsrcThreshold, PEDCA_QSRC_MAX);
+        clamped.psrcLimit = std::clamp<uint8_t>(theta.psrcLimit, PEDCA_PSRC_MIN, PEDCA_PSRC_MAX);
+        m_pedcaThetaByAid[aid] = clamped;
+    }
+    // Bumped on every push, not only on a change: the count tells a station how many tables
+    // the AP has issued, which is what makes a repeated beacon distinguishable from a new one.
+    m_pedcaUpdateCount++;
+}
+
+ApWifiMac::PedcaTheta
+ApWifiMac::GetPedcaParametersFor(uint16_t aid) const
+{
+    if (const auto it = m_pedcaThetaByAid.find(aid); it != m_pedcaThetaByAid.end())
+    {
+        return it->second;
+    }
+    return PedcaTheta{};
+}
+
+PedcaParameterSet
+ApWifiMac::GetPedcaParameterSet() const
+{
+    PedcaParameterSet parameterSet;
+    parameterSet.SetUpdateCount(m_pedcaUpdateCount);
+
+    std::vector<PedcaStaEntry> entries;
+    entries.reserve(m_pedcaThetaByAid.size());
+    for (const auto& [aid, theta] : m_pedcaThetaByAid)
+    {
+        entries.push_back(
+            PedcaStaEntry{aid, theta.cwds, theta.qsrcThreshold, theta.psrcLimit});
+    }
+    parameterSet.SetEntries(std::move(entries));
+    return parameterSet;
 }
 
 bool

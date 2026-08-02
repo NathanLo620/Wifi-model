@@ -25,6 +25,7 @@
 #include "wifi-protection-manager.h"
 
 #include "ns3/object.h"
+#include "ns3/traced-callback.h"
 
 #include <functional>
 #include <optional>
@@ -66,6 +67,33 @@ class FrameExchangeManager : public Object
     static TypeId GetTypeId();
     FrameExchangeManager();
     ~FrameExchangeManager() override;
+
+    /**
+     * The reserved RA carried by every P-EDCA DS-CTS (802.11bn draft). A DS-CTS is a
+     * CTS-to-self addressed to this well-known address, which is how both the sender
+     * and every receiver recognise one.
+     *
+     * @return the reserved P-EDCA DS-CTS receiver address
+     */
+    static const Mac48Address& GetDsCtsAddress();
+
+    /**
+     * Number of P-EDCA DS-CTS *frames* this station decoded on air. With dual DS-CTS
+     * (QosFrameExchangeManager::SetDsCtsRepeat(2)) one Stage-1 attempt puts two frames
+     * on air, so this counts roughly twice the number of attempts.
+     *
+     * @return the number of decoded DS-CTS frames
+     */
+    uint32_t GetDsCtsRxCount() const;
+    /**
+     * Number of P-EDCA DS-CTS *bursts* this station observed, i.e. the number of
+     * Stage-1 attempts it could hear. Frames arriving less than DsCtsBurstGap apart are
+     * counted as one burst. This is the quantity comparable to the sender-side
+     * QosFrameExchangeManager::GetDsCtsCount().
+     *
+     * @return the number of observed DS-CTS bursts
+     */
+    uint32_t GetDsCtsBurstRxCount() const;
 
     /**
      * typedef for a callback to invoke when an MPDU is dropped.
@@ -490,6 +518,17 @@ class FrameExchangeManager : public Object
     virtual void PostProcessFrame(Ptr<const WifiPsdu> psdu, const WifiTxVector& txVector);
 
     /**
+     * Account for a P-EDCA DS-CTS frame that this station has just decoded, and group it
+     * with the preceding one if they belong to the same Stage-1 burst.
+     *
+     * Called from PostProcessFrame() rather than from UpdateNav(): the DS-CTS branch of
+     * UpdateNav() only runs when the frame actually advances the NAV, and dual DS-CTS
+     * deliberately makes both frames of a burst expire the NAV at the same instant, so
+     * the second frame of every burst would never be seen there.
+     */
+    void NotifyDsCtsRx();
+
+    /**
      * Get the updated TX duration of the frame associated with the given TX
      * parameters if the size of the PSDU addressed to the given receiver
      * becomes <i>ppduPayloadSize</i>.
@@ -545,6 +584,11 @@ class FrameExchangeManager : public Object
     Mac48Address m_bssid;                             //!< BSSID address (Mac48Address)
     Time m_navEnd;                                    //!< NAV expiration time
     Time m_navEndFromDsCts{0}; //!< NAV expiration time set by a P-EDCA DS-CTS
+    uint32_t m_dsCtsRxCount{0};      //!< P-EDCA DS-CTS frames decoded on air
+    uint32_t m_dsCtsBurstRxCount{0}; //!< P-EDCA DS-CTS bursts (Stage-1 attempts) observed
+    Time m_lastDsCtsRxTime{0};       //!< when the last DS-CTS was decoded (0 = none yet)
+    Time m_dsCtsBurstGap{MicroSeconds(100)}; //!< gap above which a DS-CTS starts a new burst
+    TracedCallback<Time> m_dsCtsRxTrace;     //!< fired once per decoded DS-CTS frame
     Time m_txNav;                                     //!< the TXNAV timer
     std::set<Mac48Address> m_sentRtsTo; //!< the STA(s) which we sent an RTS to (waiting for CTS)
     std::set<Mac48Address>
