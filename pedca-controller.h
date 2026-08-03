@@ -18,6 +18,7 @@
 #include "ns3/traced-callback.h"
 
 #include <map>
+#include <set>
 
 namespace ns3
 {
@@ -27,6 +28,43 @@ class QosFrameExchangeManager;
 class WifiNetDevice;
 class WifiPhy;
 class WifiPpdu;
+
+/**
+ * @ingroup wifi
+ * Which rule set PedcaController uses to choose parameters.
+ */
+enum class PedcaPolicy
+{
+    /**
+     * Choose one BSS-wide parameter triple from the estimated number of stations actually
+     * using P-EDCA. Derived from the 2026-08-01 CWds x QSRC x PSRC sweeps over five traffic
+     * models and three penetrations; see PedcaController::KDrivenTheta.
+     */
+    KDRIVEN,
+    /**
+     * Regulate QSRC against what is happening on the medium right now, with no reference to
+     * how many stations are configured for P-EDCA.
+     *
+     * Two observables, both re-measured every period and both of which move with the offered
+     * load rather than with the configuration: the fraction of airtime Stage-1 is consuming,
+     * and the fraction of arriving voice frames already close to their delay bound. Too much
+     * airtime means P-EDCA is congesting itself, so QSRC goes up; frames running out of
+     * budget while airtime is cheap means there is room to be more aggressive, so QSRC comes
+     * down. Anything in between holds.
+     *
+     * This is the policy to use for bursty traffic, where the number of stations actually
+     * contending changes continuously and a configured count says nothing about it.
+     */
+    LOADDRIVEN,
+    /**
+     * The original rule set: BSS-wide CWds from the DS-CTS collision rate, a global gate on
+     * the channel busy fraction, and a per-station choice between an aggressive and a
+     * conservative corner. Kept for comparison.
+     */
+    V2,
+    /** Push one constant triple to every station. The control arm with the loop switched off. */
+    FIXED
+};
 
 /**
  * @ingroup wifi
@@ -104,6 +142,38 @@ class PedcaController : public Object
     void Step();
 
     /**
+     * Estimate how many associated stations are actually using P-EDCA.
+     *
+     * The AP has no way to ask: PedcaSupported is a station-local flag with no over-the-air
+     * capability report. What it does have is the Low Latency Indication bit, which only a
+     * P-EDCA station ever sets, so a station that has sent even one LLI-marked frame is
+     * proven to be running P-EDCA with no false positives. The set is sticky, because a
+     * station does not stop being P-EDCA-capable between periods.
+     *
+     * Known blind spot: LLI only fires once a frame's head-of-line age passes a fraction of
+     * the delay bound, so under light load the estimate reads low, possibly zero, even
+     * though P-EDCA stations are present. Use SetKOverride() to separate policy error from
+     * estimator error when validating.
+     *
+     * @return the number of stations proven to be using P-EDCA
+     */
+    uint32_t EstimatePedcaStaCount();
+
+    /**
+     * The k-driven parameter law, fitted to the 2026-08-01 sweeps.
+     *
+     * CWds is held at 1 (best in 13 of the 15 traffic x penetration cells, and worth under
+     * 3% in the other two). QSRC rises linearly with k, which is what bounds how often a
+     * station may enter Stage 1 as contention grows. PSRC falls in steps, because extra
+     * consecutive attempts pay off while the medium has room and become pure overhead once
+     * it does not.
+     *
+     * @param k the estimated number of stations using P-EDCA
+     * @return the parameter triple to advertise to every station
+     */
+    PedcaTheta KDrivenTheta(uint32_t k) const;
+
+    /**
      * PHY state trace sink, accumulating the time the channel was not idle.
      *
      * @param start when the state was entered
@@ -159,11 +229,29 @@ class PedcaController : public Object
     uint32_t m_curBurstDecoded{0};   //!< of which decoded
     Time m_lastDsCtsEvent{0};        //!< when the last DS-CTS observation arrived
     std::map<Mac48Address, uint32_t> m_lastLliByAddr; //!< per-station LLI count at last step
+    std::set<Mac48Address> m_provenPedcaStas; //!< stations proven to be running P-EDCA
 
     PedcaTheta m_initialTheta;  //!< parameters the stations start out with
     uint8_t m_cwds{0};          //!< current BSS-wide CWds
 
     // Attributes.
+    PedcaPolicy m_policy{PedcaPolicy::KDRIVEN}; //!< which rule set to apply
+    int32_t m_kOverride{-1};       //!< force k instead of estimating it; negative = estimate
+    double m_qsrcIntercept{0.5};   //!< QSRC law intercept
+    double m_qsrcSlope{0.2};       //!< QSRC law slope per P-EDCA station
+    uint8_t m_cwdsKDriven{1};      //!< CWds the k-driven law advertises
+    uint32_t m_psrc3MaxK{10};      //!< largest k that still gets PSRC 3
+    uint32_t m_psrc2MaxK{22};      //!< largest k that still gets PSRC 2
+    PedcaTheta m_fixedTheta{};     //!< the triple pushed by the FIXED policy
+    double m_overheadHigh{0.06};   //!< Stage-1 airtime above which QSRC is raised
+    double m_overheadLow{0.03};    //!< Stage-1 airtime below which QSRC may be lowered
+    double m_urgencyHigh{0.15};    //!< LLI ratio above which stations count as short of budget
+    double m_urgencyLow{0.05};     //!< LLI ratio below which the medium can be reclaimed
+    uint8_t m_qsrcFloor{1};        //!< QSRC never goes below this; 0 is bad at every load
+    Time m_burstCost{MicroSeconds(185)}; //!< medium time one Stage-1 burst costs
+    uint8_t m_qsrcLoad{2};         //!< the QSRC the load-driven loop currently holds
+    uint32_t m_lastVoRx{0};        //!< AC_VO receive count at the previous step
+    uint32_t m_lastLliTotal{0};    //!< BSS-wide LLI count at the previous step
     Time m_period{MilliSeconds(100)};  //!< control period
     Time m_dsCtsBurstGap{MicroSeconds(100)}; //!< gap above which a DS-CTS starts a new burst
     double m_busyHigh{0.85};           //!< busy fraction above which the congestion gate fires
@@ -178,9 +266,12 @@ class PedcaController : public Object
     uint8_t m_psrcConservative{1};     //!< PSRC limit of the conservative corner
     bool m_useBurstCollRate{true};     //!< whether to decide on burst- or frame-level collisions
 
-    /// Per-step trace: time, cwds, nAggressive, nConservative, nUnchanged, busyFrac,
-    /// collRate, collRateFrame, dsCtsFrames, dsCtsBursts, bsrSum, lliCount, anyChanged
+    /// Per-step trace: time, kHat, cwds, qsrc, psrc, nAggressive, nConservative, nUnchanged,
+    /// busyFrac, collRate, collRateFrame, dsCtsFrames, dsCtsBursts, bsrSum, lliCount, anyChanged
     TracedCallback<Time,
+                   uint32_t,
+                   uint8_t,
+                   uint8_t,
                    uint8_t,
                    uint32_t,
                    uint32_t,

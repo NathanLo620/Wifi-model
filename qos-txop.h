@@ -69,11 +69,12 @@ class QosTxop : public Txop
     /**
      * @brief Set the P-EDCA backoff bypass flag.
      * 
-     * When this flag is true, the next call to NotifyChannelReleased will
-     * skip backoff generation and use backoff=0 instead. This is used in
-     * P-EDCA Stage 2 to ensure immediate data transmission.
+     * When this flag is true, the next call to NotifyChannelReleased draws
+     * a fresh backoff using the P-EDCA contention parameters and immediately
+     * requests channel access. Normal EDCA medium-busy freeze/resume rules
+     * remain in effect while that Stage 2 backoff is pending.
      *
-     * @param bypass true to bypass backoff, false for normal operation
+     * @param bypass true to arm the P-EDCA Stage 2 release path, false for normal operation
      * @param linkId the ID of the link
      */
     void SetPedcaBypassBackoff(bool bypass, uint8_t linkId);
@@ -466,7 +467,7 @@ class QosTxop : public Txop
         Time muEdcaTimerStartTime{0};  //!< last start time of the MU EDCA Timer
         
         // P-EDCA support
-        bool pedcaBypassBackoff{false}; //!< skip backoff generation in P-EDCA Stage 2
+        bool pedcaBypassBackoff{false}; //!< arm fresh backoff generation for P-EDCA Stage 2
         bool pedcaSuspended{false};     //!< AC is suspended due to P-EDCA
     };
 

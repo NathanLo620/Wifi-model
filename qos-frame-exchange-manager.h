@@ -82,6 +82,12 @@ class QosFrameExchangeManager : public FrameExchangeManager
      */
     uint32_t GetLliRxCount() const { return m_lliRxCount; }
     /**
+     * Number of AC_VO frames received from stations, the denominator for the LLI ratio.
+     *
+     * @return the cumulative AC_VO receive count
+     */
+    uint32_t GetVoRxCount() const { return m_voRxCount; }
+    /**
      * Number of LLI-marked frames received from one station.
      *
      * @param addr the transmitter address to look up
@@ -333,6 +339,7 @@ class QosFrameExchangeManager : public FrameExchangeManager
     double m_lliFraction{0.7};                //!< fraction of the budget beyond which HOL age sets LLI
     bool   m_resetPsrcOnLimitChange{false};   //!< whether SetPsrc() also clears the PSRC counter
     uint32_t m_lliRxCount{0};                 //!< LLI-marked frames received (AP side)
+    uint32_t m_voRxCount{0};                  //!< AC_VO frames received (AP side)
     std::map<Mac48Address, uint32_t> m_lliRxCountByAddr; //!< LLI-marked frames received, per station
 
 
@@ -397,10 +404,13 @@ class QosFrameExchangeManager : public FrameExchangeManager
     void PedcaStage2Enter();
 
     /**
-     * End the current P-EDCA round if another transmission makes the medium busy
-     * before this station initiates its TXOP.
+     * End the current Stage 2 contention when another STA initiates an in-BSS TXOP
+     * with RTS. The remaining Stage 2 backoff is discarded; a permitted P-EDCA
+     * retry starts with a new DS-CTS contention.
+     *
+     * @param rtsHdr the decoded RTS that initiated the other TXOP
      */
-    void PedcaMediumBusy(Time duration);
+    void PedcaOtherTxopInitiated(const WifiMacHeader& rtsHdr);
 
     // P-EDCA Stage 2 collision tracking
     bool m_pedcaStage2Active{false};  //!< True after Stage 2 wins access and starts a TXOP
@@ -415,7 +425,7 @@ class QosFrameExchangeManager : public FrameExchangeManager
     uint32_t m_pedcaFailRtsCollision{0};    //!< RTS collision during Stage 2 (two P-EDCA STAs)
     uint32_t m_pedcaFailTimingExpired{0};   //!< Legacy statistic retained for output compatibility
     uint32_t m_pedcaFailDeferral{0};        //!< P-EDCA deferred (medium busy before DS-CTS)
-    uint32_t m_pedcaFailDidNotInitiateTxop{0}; //!< Another STA obtained a TXOP in Stage 2
+    uint32_t m_pedcaFailDidNotInitiateTxop{0}; //!< Another STA initiated a TXOP during Stage 2
     // Event counters
     uint32_t m_dsCtsCount{0};              //!< Number of DS-CTS frames sent
     uint32_t m_stage2EntryCount{0};        //!< Number of times Stage 2 contention entered

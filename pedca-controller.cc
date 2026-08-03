@@ -16,11 +16,14 @@
 
 #include "ns3/abort.h"
 #include "ns3/double.h"
+#include "ns3/enum.h"
+#include "ns3/integer.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "ns3/uinteger.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace ns3
 {
@@ -40,6 +43,89 @@ PedcaController::GetTypeId()
             .SetParent<Object>()
             .SetGroupName("Wifi")
             .AddConstructor<PedcaController>()
+            .AddAttribute("Policy",
+                          "Which rule set chooses the parameters: kdriven (fitted to the "
+                          "2026-08-01 sweeps), v2 (the original collision/busy/per-station "
+                          "rules), or fixed (push one constant triple)",
+                          EnumValue(PedcaPolicy::KDRIVEN),
+                          MakeEnumAccessor<PedcaPolicy>(&PedcaController::m_policy),
+                          MakeEnumChecker(PedcaPolicy::KDRIVEN,
+                                          "kdriven",
+                                          PedcaPolicy::LOADDRIVEN,
+                                          "loaddriven",
+                                          PedcaPolicy::V2,
+                                          "v2",
+                                          PedcaPolicy::FIXED,
+                                          "fixed"))
+            .AddAttribute("OverheadHigh",
+                          "Fraction of airtime spent on P-EDCA Stage-1 above which the "
+                          "load-driven policy raises QSRC",
+                          DoubleValue(0.06),
+                          MakeDoubleAccessor(&PedcaController::m_overheadHigh),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("OverheadLow",
+                          "Stage-1 airtime below which the load-driven policy is willing to "
+                          "lower QSRC, provided stations are short of delay budget",
+                          DoubleValue(0.03),
+                          MakeDoubleAccessor(&PedcaController::m_overheadLow),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("UrgencyHigh",
+                          "Fraction of arriving AC_VO frames carrying the low latency "
+                          "indication above which stations count as short of delay budget",
+                          DoubleValue(0.15),
+                          MakeDoubleAccessor(&PedcaController::m_urgencyHigh),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("UrgencyLow",
+                          "LLI ratio below which the load-driven policy reclaims medium time "
+                          "by raising QSRC, because nothing is short of delay budget",
+                          DoubleValue(0.05),
+                          MakeDoubleAccessor(&PedcaController::m_urgencyLow),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("QsrcFloor",
+                          "QSRC never goes below this. 0 lets every transmission attempt open "
+                          "a Stage 1 and measures worst or near-worst at every load.",
+                          UintegerValue(1),
+                          MakeUintegerAccessor(&PedcaController::m_qsrcFloor),
+                          MakeUintegerChecker<uint8_t>(0, PEDCA_QSRC_MAX))
+            .AddAttribute("BurstCost",
+                          "Medium time one Stage-1 burst occupies: two DS-CTS a SIFS apart "
+                          "plus the 81 us reservation",
+                          TimeValue(MicroSeconds(185)),
+                          MakeTimeAccessor(&PedcaController::m_burstCost),
+                          MakeTimeChecker())
+            .AddAttribute("KOverride",
+                          "Use this value as the number of P-EDCA stations instead of estimating "
+                          "it. Negative means estimate. Set it to the true count to measure what "
+                          "the policy is worth independently of the estimator.",
+                          IntegerValue(-1),
+                          MakeIntegerAccessor(&PedcaController::m_kOverride),
+                          MakeIntegerChecker<int32_t>(-1, 2007))
+            .AddAttribute("QsrcIntercept",
+                          "Intercept of the k-driven QSRC law, QSRC = round(intercept + slope*k)",
+                          DoubleValue(0.5),
+                          MakeDoubleAccessor(&PedcaController::m_qsrcIntercept),
+                          MakeDoubleChecker<double>())
+            .AddAttribute("QsrcSlope",
+                          "Slope per P-EDCA station of the k-driven QSRC law",
+                          DoubleValue(0.2),
+                          MakeDoubleAccessor(&PedcaController::m_qsrcSlope),
+                          MakeDoubleChecker<double>())
+            .AddAttribute("CwdsKDriven",
+                          "CWds advertised by the k-driven policy. The sweeps make this a "
+                          "don't-care, so it is held constant rather than controlled.",
+                          UintegerValue(1),
+                          MakeUintegerAccessor(&PedcaController::m_cwdsKDriven),
+                          MakeUintegerChecker<uint8_t>(0, PEDCA_CWDS_MAX))
+            .AddAttribute("Psrc3MaxK",
+                          "Largest estimated k that still receives PSRC 3",
+                          UintegerValue(10),
+                          MakeUintegerAccessor(&PedcaController::m_psrc3MaxK),
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("Psrc2MaxK",
+                          "Largest estimated k that still receives PSRC 2",
+                          UintegerValue(22),
+                          MakeUintegerAccessor(&PedcaController::m_psrc2MaxK),
+                          MakeUintegerChecker<uint32_t>())
             .AddAttribute("Period",
                           "How often the controller re-chooses the P-EDCA parameter table",
                           TimeValue(MilliSeconds(100)),
@@ -181,6 +267,36 @@ void
 PedcaController::SetInitialTheta(const PedcaTheta& theta)
 {
     m_initialTheta = theta;
+    m_fixedTheta = theta;
+}
+
+uint32_t
+PedcaController::EstimatePedcaStaCount()
+{
+    // The LLI bit is set only by a P-EDCA station, so one marked frame is proof. Sticky:
+    // capability does not come and go between periods.
+    for (const auto& [aid, addr] : m_apMac->GetStaList(0))
+    {
+        if (m_fem->GetLliRxCount(addr) > 0)
+        {
+            m_provenPedcaStas.insert(addr);
+        }
+    }
+    return static_cast<uint32_t>(m_provenPedcaStas.size());
+}
+
+PedcaTheta
+PedcaController::KDrivenTheta(uint32_t k) const
+{
+    PedcaTheta theta;
+    theta.cwds = m_cwdsKDriven;
+
+    const auto raw = std::lround(m_qsrcIntercept + m_qsrcSlope * static_cast<double>(k));
+    theta.qsrcThreshold =
+        static_cast<uint8_t>(std::clamp<long>(raw, 0, static_cast<long>(PEDCA_QSRC_MAX)));
+
+    theta.psrcLimit = (k <= m_psrc3MaxK) ? 3 : ((k <= m_psrc2MaxK) ? 2 : 1);
+    return theta;
 }
 
 void
@@ -330,6 +446,50 @@ PedcaController::Step()
     const auto dsCtsFrames = frames;
     const auto dsCtsBursts = m_bursts;
 
+    // ---- How many stations are actually using P-EDCA ----
+    const auto kHat = (m_kOverride >= 0) ? static_cast<uint32_t>(m_kOverride)
+                                         : EstimatePedcaStaCount();
+
+    // ---- Runtime load signals, both independent of how many stations are configured ----
+    // What share of the medium Stage-1 is consuming right now.
+    const auto overhead =
+        std::min(1.0,
+                 static_cast<double>(m_bursts) *
+                     static_cast<double>(m_burstCost.GetMicroSeconds()) / periodUs);
+    // What share of the voice frames arriving are already close to their delay bound.
+    const auto voRxTotal = m_fem->GetVoRxCount();
+    const auto voRx = voRxTotal - m_lastVoRx;
+    m_lastVoRx = voRxTotal;
+    const auto lliRxTotal = m_fem->GetLliRxCount();
+    const auto lliRx = lliRxTotal - m_lastLliTotal;
+    m_lastLliTotal = lliRxTotal;
+    const auto urgency = (voRx > 0) ? static_cast<double>(lliRx) / voRx : 0.0;
+
+    if (m_policy == PedcaPolicy::LOADDRIVEN)
+    {
+        // One step per period in each direction, so the loop integrates rather than chasing
+        // a single noisy observation to an extreme.
+        //
+        // Raising is driven by Stage-1 airtime alone: once P-EDCA is consuming too much of
+        // the medium it is competing with the very traffic it is meant to protect. Lowering
+        // additionally requires that something is actually short of delay budget. That
+        // asymmetry is what keeps the loop out of trouble at light load, where Stage-1
+        // airtime is near zero but nothing needs help: an airtime-only rule would read the
+        // idle medium as headroom, drop QSRC to the floor and start firing P-EDCA on sparse
+        // traffic, which measures +45% on the tail. Regulating urgency directly instead was
+        // tried and is worse at low contention (see the notes in the commit).
+        if (overhead > m_overheadHigh)
+        {
+            m_qsrcLoad = std::min<uint8_t>(m_qsrcLoad + 1, PEDCA_QSRC_MAX);
+        }
+        else if (urgency > m_urgencyHigh && overhead < m_overheadLow)
+        {
+            m_qsrcLoad = (m_qsrcLoad > m_qsrcFloor) ? static_cast<uint8_t>(m_qsrcLoad - 1)
+                                                    : m_qsrcFloor;
+        }
+        m_qsrcLoad = std::clamp(m_qsrcLoad, m_qsrcFloor, static_cast<uint8_t>(PEDCA_QSRC_MAX));
+    }
+
     // ---- BSS-wide CWds: jump straight to the target, no step limit ----
     if (dsActive && collRate > m_collHigh)
     {
@@ -354,6 +514,19 @@ PedcaController::Step()
     bool anyChanged = false;
     std::map<uint16_t, PedcaTheta> newTheta;
 
+    // Only V2 differentiates per station; the others advertise one triple to everyone.
+    PedcaTheta bssWide = m_fixedTheta;
+    if (m_policy == PedcaPolicy::KDRIVEN)
+    {
+        bssWide = KDrivenTheta(kHat);
+    }
+    else if (m_policy == PedcaPolicy::LOADDRIVEN)
+    {
+        // CWds is a measured don't-care and PSRC 3 is the best single choice once QSRC is
+        // free to move, so QSRC carries the whole loop.
+        bssWide = PedcaTheta{m_cwdsKDriven, m_qsrcLoad, 3};
+    }
+
     for (const auto& [aid, addr] : m_apMac->GetStaList(0))
     {
         uint32_t bsrSta = 0;
@@ -377,24 +550,36 @@ PedcaController::Step()
 
         const auto previous = m_apMac->GetPedcaParametersFor(aid);
         auto next = previous;
-        next.cwds = m_cwds; // CWds is a shared Stage-1 resource, not a per-station property
 
-        if (globalConservativeGate)
+        switch (m_policy)
         {
-            next.qsrcThreshold = m_qsrcConservative;
-            next.psrcLimit = m_psrcConservative;
-            nConservative++;
-        }
-        else if (lliSta >= m_lliHigh || static_cast<double>(bsrSta) >= m_bsrPerStaHigh)
-        {
-            next.qsrcThreshold = m_qsrcAggressive;
-            next.psrcLimit = m_psrcAggressive;
-            nAggressive++;
-        }
-        else
-        {
-            // Nothing worth reacting to: leave this station where it was.
+        case PedcaPolicy::KDRIVEN:
+        case PedcaPolicy::LOADDRIVEN:
+        case PedcaPolicy::FIXED:
+            next = bssWide;
             nUnchanged++;
+            break;
+
+        case PedcaPolicy::V2:
+            next.cwds = m_cwds; // CWds is a shared Stage-1 resource, not a per-station property
+            if (globalConservativeGate)
+            {
+                next.qsrcThreshold = m_qsrcConservative;
+                next.psrcLimit = m_psrcConservative;
+                nConservative++;
+            }
+            else if (lliSta >= m_lliHigh || static_cast<double>(bsrSta) >= m_bsrPerStaHigh)
+            {
+                next.qsrcThreshold = m_qsrcAggressive;
+                next.psrcLimit = m_psrcAggressive;
+                nAggressive++;
+            }
+            else
+            {
+                // Nothing worth reacting to: leave this station where it was.
+                nUnchanged++;
+            }
+            break;
         }
 
         if (!(next == previous))
@@ -407,10 +592,17 @@ PedcaController::Step()
     m_apMac->SetPedcaParametersBulk(newTheta);
     m_stepCount++;
 
+    const auto shownCwds = (m_policy == PedcaPolicy::V2) ? m_cwds : bssWide.cwds;
+    const auto shownQsrc = (m_policy == PedcaPolicy::V2) ? 0 : bssWide.qsrcThreshold;
+    const auto shownPsrc = (m_policy == PedcaPolicy::V2) ? 0 : bssWide.psrcLimit;
+
     if (anyChanged)
     {
         std::clog << "[P-EDCA CTRL] t=" << Simulator::Now().GetMicroSeconds()
-                  << "us cwds=" << +m_cwds << " aggr=" << nAggressive
+                  << "us kHat=" << kHat << " overhead=" << overhead
+                  << " urgency=" << urgency
+                  << " cwds=" << +shownCwds << " qsrc=" << +shownQsrc
+                  << " psrc=" << +shownPsrc << " aggr=" << nAggressive
                   << " cons=" << nConservative << " keep=" << nUnchanged
                   << " busyFrac=" << busyFrac << " collRate=" << collRate
                   << " collRateFrame=" << collRateFrame << " dsCtsFrames=" << dsCtsFrames
@@ -419,7 +611,10 @@ PedcaController::Step()
     }
 
     m_controlStepTrace(Simulator::Now(),
-                       m_cwds,
+                       kHat,
+                       shownCwds,
+                       shownQsrc,
+                       shownPsrc,
                        nAggressive,
                        nConservative,
                        nUnchanged,

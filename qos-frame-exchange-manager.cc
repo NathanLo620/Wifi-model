@@ -158,21 +158,7 @@ void
 QosFrameExchangeManager::SetChannelAccessManager(
     const Ptr<ChannelAccessManager> channelAccessManager)
 {
-    if (m_channelAccessManager)
-    {
-        m_channelAccessManager->TraceDisconnectWithoutContext(
-            "MediumBusy",
-            MakeCallback(&QosFrameExchangeManager::PedcaMediumBusy, this));
-    }
-
     FrameExchangeManager::SetChannelAccessManager(channelAccessManager);
-
-    if (m_channelAccessManager)
-    {
-        m_channelAccessManager->TraceConnectWithoutContext(
-            "MediumBusy",
-            MakeCallback(&QosFrameExchangeManager::PedcaMediumBusy, this));
-    }
 }
 
 void
@@ -202,12 +188,6 @@ void
 QosFrameExchangeManager::DoDispose()
 {
     NS_LOG_FUNCTION(this);
-    if (m_channelAccessManager)
-    {
-        m_channelAccessManager->TraceDisconnectWithoutContext(
-            "MediumBusy",
-            MakeCallback(&QosFrameExchangeManager::PedcaMediumBusy, this));
-    }
     m_edca = nullptr;
     m_edcaBackingOff = nullptr;
     m_pifsRecoveryEvent.Cancel();
@@ -1472,6 +1452,12 @@ QosFrameExchangeManager::PreProcessFrame(Ptr<const WifiPsdu> psdu, const WifiTxV
                 // stored as a buffer status report.
                 if (m_mac->GetPedcaSupported() || (m_apMac && m_apMac->GetPedcaControl()))
                 {
+                    if (QosUtilsMapTidToAc(hdr.GetQosTid()) == AC_VO)
+                    {
+                        // Denominator for the LLI ratio: what fraction of the voice frames
+                        // arriving are already close to their delay bound.
+                        m_voRxCount++;
+                    }
                     if (hdr.GetQosLli())
                     {
                         m_lliRxCount++;
@@ -1499,8 +1485,18 @@ QosFrameExchangeManager::PostProcessFrame(Ptr<const WifiPsdu> psdu, const WifiTx
 {
     NS_LOG_FUNCTION(this << psdu << txVector);
 
-    SetTxopHolder(psdu->GetHeader(0), txVector);
+    const auto& hdr = psdu->GetHeader(0);
+    SetTxopHolder(hdr, txVector);
     FrameExchangeManager::PostProcessFrame(psdu, txVector);
+
+    // Draft D1.5: a decoded in-BSS RTS means that another STA has initiated a
+    // TXOP and the current P-EDCA contention is over for a STA that has not yet
+    // initiated one. Do this after the base post-processing so that the RTS NAV
+    // is already installed before a fresh Stage-1 access request is scheduled.
+    if (hdr.IsRts())
+    {
+        PedcaOtherTxopInitiated(hdr);
+    }
 }
 
 void
@@ -1755,35 +1751,49 @@ QosFrameExchangeManager::PedcaStage2Enter()
     {
         return;
     }
+    // Stage 2 is started after every transmitted DS-CTS, independently of whether
+    // the DS-CTS overlapped another transmission.  NotifyChannelReleased() draws
+    // the P-EDCA backoff and requests access.  If the medium is currently busy
+    // (for example, an overlapping 52 us RTS remains on air for 8 us after the
+    // 44 us DS-CTS ends), ChannelAccessManager applies the normal EDCA rules: the
+    // backoff remains frozen and resumes after the medium becomes idle and AIFS
+    // has elapsed. A generic busy indication does not by itself cancel the
+    // P-EDCA contention. A successfully decoded in-BSS RTS is handled separately
+    // by PedcaOtherTxopInitiated(), because it proves that another STA initiated
+    // a TXOP and therefore ends this contention under Draft D1.5.
     m_pedcaEdca->SetPedcaBypassBackoff(true, m_linkId);
     NotifyChannelReleased(m_pedcaEdca);
 }
 
 void
-QosFrameExchangeManager::PedcaMediumBusy(Time duration)
+QosFrameExchangeManager::PedcaOtherTxopInitiated(const WifiMacHeader& rtsHdr)
 {
-    // A busy event after DS-CTS and before this STA starts its initial frame means
-    // that this STA did not initiate the TXOP. RX-start and CCA-busy may both fire
-    // for one signal; clearing m_pedcaPending makes this callback idempotent.
-    if (!m_pedcaPending || m_pedcaStage2Active || !m_pedcaEdca)
+    if (!m_pedcaPending || m_pedcaStage2Active || !m_pedcaEdca ||
+        rtsHdr.GetAddr2() == m_self ||
+        (rtsHdr.GetAddr1() != m_bssid && rtsHdr.GetAddr2() != m_bssid))
     {
         return;
     }
 
     Ptr<QosTxop> edca = m_pedcaEdca;
+    const uint32_t remainingSlots = edca->GetBackoffSlots(m_linkId);
     const double gapUs =
         (m_pedcaCtsTxEnd > Seconds(0))
             ? (Simulator::Now() - m_pedcaCtsTxEnd).GetMicroSeconds()
             : -1.0;
 
+    // This STA did not initiate a TXOP in the contention started by its last
+    // DS-CTS. Discard the remaining Stage-2 backoff. QSRC is intentionally not
+    // incremented because this STA did not transmit an RTS; PSRC was already
+    // incremented when the DS-CTS was transmitted.
     m_pedcaPending = false;
     m_pedcaCtsTxEnd = Seconds(0);
     m_dsCtsTxRemaining = 0;
     m_pedcaFailDidNotInitiateTxop++;
     m_pedcaAttempts.push_back(
-         {Simulator::Now().GetMicroSeconds() - std::max(gapUs, 0.0),
+        {Simulator::Now().GetMicroSeconds() - std::max(gapUs, 0.0),
          gapUs,
-         static_cast<int>(edca->GetBackoffSlots(m_linkId)),
+         static_cast<int>(remainingSlots),
          "DID_NOT_INITIATE_TXOP"});
     m_lastStage2GapUs = -1.0;
     m_lastBackoffSlots = -1;
@@ -1791,36 +1801,40 @@ QosFrameExchangeManager::PedcaMediumBusy(Time duration)
     constexpr uint32_t VO_DEFAULT_CWMIN = 3;
     constexpr uint32_t VO_DEFAULT_CWMAX = 7;
     constexpr uint8_t VO_DEFAULT_AIFSN = 2;
-    edca->SetMinCw(VO_DEFAULT_CWMIN, m_linkId);
-    edca->SetMaxCw(VO_DEFAULT_CWMAX, m_linkId);
+
+    // Cancel the outstanding Stage-2 request before replacing its remaining
+    // backoff. The new request is made immediately, but the RTS NAV and normal
+    // carrier sensing keep it deferred until the other TXOP has completed.
+    edca->SetPedcaSuspended(true, m_linkId);
     edca->SetAifsn(VO_DEFAULT_AIFSN, m_linkId);
 
     const bool canRetryPedca =
         (m_qsrc >= m_qsrc_threshold) && (m_psrc < m_psrc_limit) &&
-        (m_mac->GetFrameRetryLimit() > m_qsrc_threshold) &&
-        (edca->GetAifsn(m_linkId) > 0);
+        (m_mac->GetFrameRetryLimit() > m_qsrc_threshold);
 
     if (canRetryPedca)
     {
+        // Draft D1.5 requires another DS-CTS to start a new P-EDCA
+        // contention. Generate a fresh DSr; do not reuse Stage-2 slots.
         edca->GeneratePedcaStage1Backoff(m_cwds, m_linkId);
     }
     else
     {
-        ResumePedcaSuspendedACs();
+        edca->SetMinCw(VO_DEFAULT_CWMIN, m_linkId);
+        edca->SetMaxCw(VO_DEFAULT_CWMAX, m_linkId);
         edca->GenerateBackoff(m_linkId);
+        ResumePedcaSuspendedACs();
     }
 
-    if (edca->GetAccessStatus(m_linkId) == Txop::NOT_REQUESTED)
-    {
-        m_channelAccessManager->RequestAccess(edca);
-    }
+    edca->SetPedcaSuspended(false, m_linkId);
 
-    std::clog << "[P-EDCA STAGE2 END:DID_NOT_INITIATE_TXOP] t="
+    std::clog << "[P-EDCA STAGE2 END:OTHER_TXOP] t="
               << Simulator::Now().GetMicroSeconds() << "us"
-              << " busyDuration=" << duration.GetMicroSeconds() << "us"
-              << " gap=" << gapUs << "us"
+              << " winner=" << rtsHdr.GetAddr2()
+              << " discardedBackoff=" << remainingSlots << " slots"
+              << " QSRC=" << m_qsrc
               << " PSRC=" << +m_psrc << "/" << +m_psrc_limit
-              << (canRetryPedca ? " -> retry Stage 1" : " -> ordinary EDCA")
+              << (canRetryPedca ? " -> new DS-CTS contention" : " -> ordinary EDCA")
               << std::endl;
 }
 
