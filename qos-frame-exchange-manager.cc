@@ -30,6 +30,10 @@ NS_LOG_COMPONENT_DEFINE("QosFrameExchangeManager");
 
 NS_OBJECT_ENSURE_REGISTERED(QosFrameExchangeManager);
 
+/// Base AIFSN of a P-EDCA slot boundary: D1.5 37.2.2 sets AIFSN[AC] to 2+DSr for the DS-CTS.
+/// Also the dot11EDCATable AC_VO AIFSN that ArmPedcaStage1() restores.
+constexpr uint8_t PEDCA_STAGE1_AIFSN_BASE = 2;
+
 TypeId
 QosFrameExchangeManager::GetTypeId()
 {
@@ -398,6 +402,13 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                           << " m_pedcaPending=" << (m_pedcaPending ? "TRUE" : "FALSE")
                           << std::endl;
 
+                // ArmPedcaStage1() raised AIFSN[AC_VO] to 2+DSr so that the ChannelAccessManager
+                // would hold this EDCAF back until the P-EDCA slot boundary.  That boundary has
+                // now been reached (or this access attempt is about to be abandoned), so put
+                // AIFSN back before anything below reads it.  PedcaPhyTxEndCallback applies the
+                // Stage-2 AIFSN separately, once the DS-CTS burst is on air.
+                RestorePedcaStage1Aifsn(m_edca);
+
                 bool qsrcOk = (m_qsrc >= m_qsrc_threshold);
                 bool psrcOk = (m_psrc < m_psrc_limit);
                 bool retryLimitOk = (m_mac->GetFrameRetryLimit() > m_qsrc_threshold);
@@ -426,6 +437,9 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                      
                      // If deferral is required, we effectively "do NOT schedule DS-CTS".
                      // We must abort this access attempt to respect the deferral rules.
+                     // NOTE: D1.5 37.2.2 NOTE 5 would have this attempt re-arm and send the
+                     // DS-CTS at the P-EDCA slot boundary following the deferral period,
+                     // instead of falling back to an ordinary EDCA backoff as we do here.
                      auto deferredEdca = m_edca;
                      NotifyChannelReleased(deferredEdca);
 
@@ -473,7 +487,10 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     Time sifs = m_phy->GetSifs();    // 16µs for 5GHz OFDM
                     Time slotTime = m_phy->GetSlot(); // 9µs for OFDM
                     uint8_t aifsn = 2;               // DS-CTS sent at AIFSN=2 P-EDCA slot boundary
-                    uint32_t dsr = m_edca->GetBackoffSlots(m_linkId); // DSr drawn from [0, CWds]
+                    // DSr drawn from [0, CWds] when this attempt was armed.  Do NOT read
+                    // GetBackoffSlots() here: the DSr slots have been counted down to 0 by the
+                    // time access is granted, so it would always report 0.
+                    uint32_t dsr = m_pedcaDsr;
 
                     // P-EDCA slot boundary from lastBusy = SIFS + (2+DSr)*Slot
                     Time lastBusyPlusSifs = accessGrantStart;  // accessGrantStart = lastBusy + SIFS
@@ -484,10 +501,19 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                     Time gapFromAccessGrant = nowTime - accessGrantStart;
                     Time targetGapFromGrant = (aifsn + dsr) * slotTime;  // (2+DSr)×9µs
 
+                    // Slots actually counted down past AIFS before this grant.  Equal to DSr
+                    // when the medium stayed idle; smaller when a deferral consumed part of it
+                    // before the medium went busy again and the counter froze.
+                    const int64_t measuredSlots =
+                        (gapFromAccessGrant.GetMicroSeconds() -
+                         (aifsn * slotTime).GetMicroSeconds()) /
+                        slotTime.GetMicroSeconds();
+
                     std::clog << "[P-EDCA STAGE1] Sending DS-CTS at t="
                               << nowTime.GetMicroSeconds() << "us"
                               << " (P-EDCA slot boundary: +" << (sifs + targetGapFromGrant).GetMicroSeconds()
-                              << "µs from lastBusy, DSr=" << dsr << ")" << std::endl;
+                              << "µs from lastBusy, DSr=" << dsr
+                              << ", slotsCountedDown=" << measuredSlots << ")" << std::endl;
 
                     if (gapFromAccessGrant > targetGapFromGrant + MicroSeconds(200)) {
                          std::clog << "[P-EDCA TIMING] Channel was idle; gap from grant="
@@ -1212,6 +1238,10 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
         // AIFSN=0 when a dual DS-CTS burst is used, and the "aifsn_nonzero" guard further down
         // (and in the Stage-1 trigger) would read 0 and silently disable P-EDCA for good.
         m_edca->SetAifsn(2, m_linkId);
+        // This write also cancels any outstanding Stage-1 arming, so drop the flag with it --
+        // otherwise m_pedcaStage1Armed would claim AIFSN is still 2+DSr when it is 2, and the
+        // Stage-1 trace would report a DSr that never shaped the grant.
+        m_pedcaStage1Armed = false;
         m_dsCtsTxRemaining = 0;
 
         // Stage 2 failure: Apply CW expansion using QSRC formula (per spec 5.3)
@@ -1286,6 +1316,7 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
             // Stage 2 may have been armed with AIFSN=0 (dual DS-CTS); restore it before the
             // aifsn_nonzero start condition below is evaluated, otherwise P-EDCA never retriggers.
             m_edca->SetAifsn(2, m_linkId);
+            m_pedcaStage1Armed = false; // see the matching note in the Stage-2 branch above
             std::clog << "[P-EDCA RESTORE] Returning to normal EDCA after failure" << std::endl;
         }
 
@@ -1329,38 +1360,28 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
         m_initialFrame = false;
         NotifyChannelReleased(m_edca);
         
-        // P-EDCA TIMING FIX:
-        // NotifyChannelReleased above called GenerateBackoff which set a random EDCA backoff.
-        // We must override this with DSr drawn from [0, CWds] so the DS-CTS fires at:
-        //   LastBusy + SIFS + AIFSN*Slot + DSr*Slot  (= P-EDCA slot boundary per D1.3)
+        // NotifyChannelReleased above called GenerateBackoff, which drew an ordinary EDCA
+        // backoff from [0, CW].  Replace it with a P-EDCA Stage-1 arming, so that the next
+        // grant lands on a P-EDCA slot boundary instead.
         if (m_mac->GetPedcaSupported() && m_edca->GetAccessCategory() == AC_VO &&
             m_qsrc >= m_qsrc_threshold && m_psrc < m_psrc_limit)
         {
-             Ptr<ChannelAccessManager> cam = m_mac->GetChannelAccessManager(m_linkId);
-             if (cam)
+             ArmPedcaStage1(m_edca);
+
+             if (Ptr<ChannelAccessManager> cam = m_mac->GetChannelAccessManager(m_linkId))
              {
-                 Time slot = m_phy->GetSlot();
-                 Time accessGrantStart = cam->GetAccessGrantStart(); // LastBusy + SIFS
-                 Time backoffEnd = accessGrantStart + m_edca->GetAifsn(m_linkId) * slot;
+                 const Time slot = m_phy->GetSlot();
+                 const Time accessGrantStart = cam->GetAccessGrantStart(); // LastBusy + SIFS
+                 const Time aifs = m_phy->GetSifs() + m_edca->GetAifsn(m_linkId) * slot;
 
-                 // Draw DSr = random[0, CWds] using the QosTxop RNG.
-                 // GeneratePedcaStage1Backoff sets link.backoffSlots = GetInteger(0, cwds).
-                 m_edca->GeneratePedcaStage1Backoff(m_cwds, m_linkId);
-                 uint32_t dsr = m_edca->GetBackoffSlots(m_linkId);
-
-                 // Override the EDCA random backoff so the CAM fires exactly at
-                 // backoffEnd + dsr*slot.  We do this by:
-                 //   backoffSlots -= dsr  (= 0 after this)
-                 //   backoffStart  = backoffEnd + dsr*slot
-                 // So the CAM fires at backoffStart + backoffSlots*slot
-                 //   = (backoffEnd + dsr*slot) + 0 = backoffEnd + dsr*slot  ✓
-                 m_edca->UpdateBackoffSlotsNow(dsr, backoffEnd + dsr * slot, m_linkId);
-
-                 std::clog << "[P-EDCA STAGE1 TIMING] DSr=" << dsr
+                 std::clog << "[P-EDCA STAGE1 TIMING] DSr=" << m_pedcaDsr
                            << " CWds=" << m_cwds
-                           << " targetTime=" << (backoffEnd + dsr * slot).GetMicroSeconds()
-                           << "us (lastBusy+" << (accessGrantStart - m_phy->GetSifs() + backoffEnd - accessGrantStart + dsr * slot).GetMicroSeconds()
-                           << "us)" << std::endl;
+                           << " AIFSN=" << +m_edca->GetAifsn(m_linkId)
+                           << " targetTime="
+                           << (accessGrantStart + m_edca->GetAifsn(m_linkId) * slot)
+                                  .GetMicroSeconds()
+                           << "us (lastBusy+" << aifs.GetMicroSeconds()
+                           << "us; a busy medium restarts this AIFS)" << std::endl;
              }
         }
 
@@ -1807,6 +1828,7 @@ QosFrameExchangeManager::PedcaOtherTxopInitiated(const WifiMacHeader& rtsHdr)
     // carrier sensing keep it deferred until the other TXOP has completed.
     edca->SetPedcaSuspended(true, m_linkId);
     edca->SetAifsn(VO_DEFAULT_AIFSN, m_linkId);
+    m_pedcaStage1Armed = false; // AIFSN is back to 2; ArmPedcaStage1 below re-raises it if we retry
 
     const bool canRetryPedca =
         (m_qsrc >= m_qsrc_threshold) && (m_psrc < m_psrc_limit) &&
@@ -1815,8 +1837,9 @@ QosFrameExchangeManager::PedcaOtherTxopInitiated(const WifiMacHeader& rtsHdr)
     if (canRetryPedca)
     {
         // Draft D1.5 requires another DS-CTS to start a new P-EDCA
-        // contention. Generate a fresh DSr; do not reuse Stage-2 slots.
-        edca->GeneratePedcaStage1Backoff(m_cwds, m_linkId);
+        // contention. Arm a fresh DSr; do not reuse Stage-2 slots.
+        // ArmPedcaStage1 sets AIFSN, so it must run after the SetAifsn above, not before.
+        ArmPedcaStage1(edca);
     }
     else
     {
@@ -1836,6 +1859,54 @@ QosFrameExchangeManager::PedcaOtherTxopInitiated(const WifiMacHeader& rtsHdr)
               << " PSRC=" << +m_psrc << "/" << +m_psrc_limit
               << (canRetryPedca ? " -> new DS-CTS contention" : " -> ordinary EDCA")
               << std::endl;
+}
+
+void
+QosFrameExchangeManager::ArmPedcaStage1(Ptr<QosTxop> edca)
+{
+    // GeneratePedcaStage1Backoff() parks a fresh GetInteger(0, CWds) in the backoff counter;
+    // that is the only public route to the QosTxop RNG, so read DSr back from there.
+    edca->GeneratePedcaStage1Backoff(m_cwds, m_linkId);
+    m_pedcaDsr = edca->GetBackoffSlots(m_linkId);
+
+    // Move DSr out of the backoff counter and into AIFSN (see ArmPedcaStage1's doc comment for
+    // why the distinction matters).  Subtracting m_pedcaDsr empties the counter while leaving
+    // backoffStart where GenerateBackoff() put it, so ChannelAccessManager still aligns it to
+    // the next slot boundary the same way it does for any other EDCAF.
+    edca->UpdateBackoffSlotsNow(m_pedcaDsr, edca->GetBackoffStart(m_linkId), m_linkId);
+    edca->SetAifsn(static_cast<uint8_t>(PEDCA_STAGE1_AIFSN_BASE + m_pedcaDsr), m_linkId);
+    m_pedcaStage1Armed = true;
+}
+
+void
+QosFrameExchangeManager::RestorePedcaStage1Aifsn(Ptr<QosTxop> edca)
+{
+    if (!m_pedcaStage1Armed)
+    {
+        // No Stage-1 arming is outstanding, so no DSr shaped this access grant.  Clear the
+        // recorded value, otherwise the Stage-1 trace would report a stale DSr against a
+        // DS-CTS that actually went out on an ordinary EDCA backoff.  That happens on the
+        // non-initial-frame failure path, which releases the EDCAF through
+        // Txop::NotifyChannelReleased() and therefore cannot keep an arming alive.
+        m_pedcaDsr = 0;
+        return;
+    }
+    m_pedcaStage1Armed = false;
+    if (!edca)
+    {
+        return;
+    }
+    if (edca->GetAifsn(m_linkId) != PEDCA_STAGE1_AIFSN_BASE + m_pedcaDsr)
+    {
+        // AIFSN[AC_VO] was rewritten after this attempt was armed, so DSr did not shape the
+        // grant.  The usual cause is a beacon carrying an EDCA Parameter Set, which
+        // StaWifiMac::SetEdcaParameters() applies verbatim (sta-wifi-mac.cc:2092).  Report the
+        // attempt as unshaped and leave the newly advertised AIFSN in place rather than
+        // stomping it with our base value.
+        m_pedcaDsr = 0;
+        return;
+    }
+    edca->SetAifsn(PEDCA_STAGE1_AIFSN_BASE, m_linkId);
 }
 
 void

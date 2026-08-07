@@ -311,6 +311,31 @@ class QosFrameExchangeManager : public FrameExchangeManager
     void ResumePedcaSuspendedACs();
 
     /**
+     * Arm a P-EDCA Stage-1 attempt: draw DSr from [0, CWds], empty the backoff counter and
+     * raise AIFSN[AC_VO] to 2+DSr, so that ChannelAccessManager grants access exactly at the
+     * next P-EDCA slot boundary.
+     *
+     * D1.5 37.2.2 defines a P-EDCA slot boundary as "an EDCA slot boundary (see (a) to (f) in
+     * 10.23.2.4) except that AIFSN[AC] is set to 2+DSr".  DSr therefore belongs to AIFS, not
+     * to the backoff counter, and the difference is observable: AIFS restarts in full after
+     * every busy medium, whereas a backoff counter freezes and resumes.  Putting DSr in the
+     * counter lets a deferral consume it, which collapses every CWds back onto the DSr=0
+     * boundary.  The backoff counter is emptied because the STA transmits the DS-CTS at the
+     * *first* P-EDCA slot boundary, with no random backoff on top.
+     *
+     * @param edca the AC_VO EDCAF to arm
+     */
+    void ArmPedcaStage1(Ptr<QosTxop> edca);
+
+    /**
+     * Undo the AIFSN change made by ArmPedcaStage1(), putting AIFSN[AC_VO] back to its
+     * dot11EDCATable value. A no-op if no Stage-1 attempt is currently armed.
+     *
+     * @param edca the AC_VO EDCAF to restore
+     */
+    void RestorePedcaStage1Aifsn(Ptr<QosTxop> edca);
+
+    /**
      * Cancel the PIFS recovery event and have the EDCAF attempting PIFS recovery
      * release the channel.
      */
@@ -328,6 +353,8 @@ class QosFrameExchangeManager : public FrameExchangeManager
     uint8_t m_psrc{0};                       //!< P-EDCA STA Retry Counter (consecutive DS-CTS attempts)
     uint16_t m_qsrc{0};                      //!< Queue Size Retry Counter (tracks VO retry conditions)
     uint32_t m_cwds{0};                      //!< CWds: Stage-1 contention window (0 = ASAP, 1+ = random backoff)
+    uint32_t m_pedcaDsr{0};                  //!< DSr drawn from [0, CWds] for the pending Stage-1 attempt
+    bool m_pedcaStage1Armed{false};          //!< true while AIFSN[AC_VO] is raised to 2+DSr by ArmPedcaStage1()
 
     // P-EDCA thresholds — runtime-configurable (set via SetQsrc/SetPsrc before sim start,
     // or dynamically from AP via future signalling).  Defaults match 802.11be draft D1.1.
