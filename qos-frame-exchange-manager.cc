@@ -418,7 +418,15 @@ QosFrameExchangeManager::StartTransmission(Ptr<QosTxop> edca, Time txopDuration)
                 // DEFERRAL RULES: Check EIFS (implicit), CTS/Ack Timeout, and NAV.
                 // DS-CTS follows virtual carrier sensing. HE/EHT STAs therefore
                 // defer while either the basic or intra-BSS NAV is active.
-                bool navActive = !PedcaVirtualCsMediumIdle();
+                // TEMPORARY (study): PEDCA_NAV_SRC=cam makes the deferral rule read the same
+                // NAV the ChannelAccessManager just used to grant this access, instead of the
+                // FEM's two NAV timers, which upstream ns-3 lets drift apart from it.
+                static const bool useCamNav =
+                    !getenv("PEDCA_NAV_SRC") || std::string(getenv("PEDCA_NAV_SRC")) != "fem";
+                bool navActive =
+                    useCamNav
+                        ? (m_mac->GetChannelAccessManager(m_linkId)->GetNavEnd() > Simulator::Now())
+                        : !PedcaVirtualCsMediumIdle();
                 bool phyBusy = (m_phy->IsStateTx() || m_phy->IsStateRx() || m_phy->IsStateSwitching() || m_phy->IsStateCcaBusy());
 
                 bool deferralRequired = waitingForResponse || navActive || phyBusy;
@@ -1185,14 +1193,6 @@ QosFrameExchangeManager::TransmissionSucceeded()
     }
     m_initialFrame = false;
     m_sentFrameTo.clear();
-
-    if (m_pifsRecovery)
-    {
-        m_pifsRecovery = false;
-        // restore the contention window that was reset when granting access for PIFS recovery
-        // m_edcaBackingOff->SetCw(m_edcaBackingOff->GetCw(m_linkId)); // Error: SetCw does not exist
-        m_edcaBackingOff = nullptr;
-    }
 }
 
 void
@@ -1355,9 +1355,15 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
         {
             m_edca->UpdateFailedCw(m_linkId);
         }
-        // The initial TXOP is terminated before releasing the EDCAF. The
-        // release path can request access immediately when NAV expires.
-        m_initialFrame = false;
+        const bool pedcaVo =
+            m_mac->GetPedcaSupported() && m_edca->GetAccessCategory() == AC_VO;
+        // P-EDCA publishes the state transition before releasing the EDCAF because
+        // its release path can immediately re-arm Stage 1.  Ordinary EDCA keeps the
+        // upstream ns-3 ordering and clears m_initialFrame at the end of this method.
+        if (pedcaVo)
+        {
+            m_initialFrame = false;
+        }
         NotifyChannelReleased(m_edca);
         
         // NotifyChannelReleased above called GenerateBackoff, which drew an ordinary EDCA
@@ -1419,20 +1425,34 @@ QosFrameExchangeManager::TransmissionFailed(bool forceCurrentCw)
             // method of the Txop class, which only generates a new backoff value and
             // requests channel access if needed,
             NS_LOG_DEBUG("TX of a non-initial frame of a TXOP failed: invoke backoff");
-            // CW and QSRC shall be updated in this case (see Section 10.23.2.2 of 802.11-2020)
-            if (!forceCurrentCw)
+            const bool pedcaVo =
+                m_mac->GetPedcaSupported() && m_edca->GetAccessCategory() == AC_VO;
+            if (!pedcaVo)
             {
-                m_edca->UpdateFailedCw(m_linkId);
+                // Preserve the upstream EDCA order. NotifyChannelReleased draws the
+                // backoff using the current CW; the failed CW is updated afterwards.
+                m_edca->Txop::NotifyChannelReleased(m_linkId);
+                if (!forceCurrentCw)
+                {
+                    m_edca->UpdateFailedCw(m_linkId);
+                }
+                m_edcaBackingOff = m_edca;
+                m_edca = nullptr;
             }
-            // Publish the complete backing-off state before releasing the
-            // EDCAF. NotifyChannelReleased may request access immediately when
-            // NAV has just expired, so callbacks must not observe an initial
-            // frame that is already transitioning to backoff.
-            auto backingOffEdca = m_edca;
-            m_edcaBackingOff = backingOffEdca;
-            m_initialFrame = false;
-            m_edca = nullptr;
-            backingOffEdca->Txop::NotifyChannelReleased(m_linkId);
+            else
+            {
+                // P-EDCA can re-arm immediately from the release callback, so publish
+                // the complete backing-off state before releasing this EDCAF.
+                if (!forceCurrentCw)
+                {
+                    m_edca->UpdateFailedCw(m_linkId);
+                }
+                auto backingOffEdca = m_edca;
+                m_edcaBackingOff = backingOffEdca;
+                m_initialFrame = false;
+                m_edca = nullptr;
+                backingOffEdca->Txop::NotifyChannelReleased(m_linkId);
+            }
         }
     }
     m_initialFrame = false;

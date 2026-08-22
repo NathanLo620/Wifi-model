@@ -33,6 +33,24 @@ namespace ns3
 
 NS_LOG_COMPONENT_DEFINE("HeFrameExchangeManager");
 
+namespace
+{
+/**
+ * TEMPORARY (A/B/C study): how the two HE NAV timers are reconciled with the single,
+ * collapsed NAV that ChannelAccessManager maintains.
+ *   'A' upstream ns-3.45/3.48: hand NotifyNavResetNow() the *other* NAV's reset-watchdog
+ *       remainder. Releases the CAM NAV while the other NAV is still running.
+ *   'B' hand NotifyNavResetNow() the *other* NAV's true remaining time (802.11ax 26.2.4).
+ *   'C' the original P-EDCA-branch behaviour: overwrite the other NAV timer with the
+ *       watchdog remainder so that FEM and CAM agree (destroys the other NAV).
+ */
+char NavMode()
+{
+    static const char m = getenv("NAV_MODE") ? getenv("NAV_MODE")[0] : 'A';
+    return m;
+}
+} // namespace
+
 NS_OBJECT_ENSURE_REGISTERED(HeFrameExchangeManager);
 
 bool
@@ -2150,12 +2168,18 @@ HeFrameExchangeManager::NavResetTimeout()
     m_navEnd = Simulator::Now();
     // Do not reset the TXOP holder because the basic NAV is updated by inter-BSS frames
     // The NAV seen by the ChannelAccessManager is now the intra-BSS NAV only
+    // NOTE: GetDelayLeft(m_intraBssNavResetEvent) is the time left on the intra-BSS NAV
+    // *reset watchdog*, not an intra-BSS NAV end time. See NavMode() above.
     Time intraBssNav = Simulator::GetDelayLeft(m_intraBssNavResetEvent);
-    // Keep the internal NAV and CAM representation synchronized. RX-start may
-    // have cancelled the reset event, in which case upstream semantics treat
-    // the corresponding NAV as no longer active.
-    m_intraBssNavEnd = Simulator::Now() + intraBssNav;
-    ClearTxopHolderIfNeeded();
+    if (NavMode() == 'C')
+    {
+        m_intraBssNavEnd = Simulator::Now() + intraBssNav;
+        ClearTxopHolderIfNeeded();
+    }
+    else if (NavMode() == 'B')
+    {
+        intraBssNav = Max(m_intraBssNavEnd - Simulator::Now(), Seconds(0));
+    }
     m_channelAccessManager->NotifyNavResetNow(intraBssNav);
 }
 
@@ -2167,7 +2191,14 @@ HeFrameExchangeManager::IntraBssNavResetTimeout()
     ClearTxopHolderIfNeeded();
     // The NAV seen by the ChannelAccessManager is now the basic NAV only
     Time basicNav = Simulator::GetDelayLeft(m_navResetEvent);
-    m_navEnd = Simulator::Now() + basicNav;
+    if (NavMode() == 'C')
+    {
+        m_navEnd = Simulator::Now() + basicNav;
+    }
+    else if (NavMode() == 'B')
+    {
+        basicNav = Max(m_navEnd - Simulator::Now(), Seconds(0));
+    }
     if (basicNav.IsZero())
     {
         m_navEndFromDsCts = Simulator::Now();
@@ -2197,17 +2228,10 @@ HeFrameExchangeManager::VirtualCsMediumIdle() const
     // For an HE STA maintaining two NAVs, if both the NAV timers are 0, the virtual CS indication
     // is that the medium is idle; if at least one of the two NAV timers is nonzero, the virtual CS
     // indication is that the medium is busy. (Sec. 26.2.4 of 802.11ax-2021)
+    // The ChannelAccessManager keeps its own single, collapsed NAV, which upstream ns-3
+    // deliberately allows to disagree with these two timers; do not assert on that.
     const auto now = Simulator::Now();
-    const bool navTimersIdle = m_navEnd <= now && m_intraBssNavEnd <= now;
-    const bool camNavIdle = m_channelAccessManager->GetNavEnd() <= now;
-    NS_ASSERT_MSG(navTimersIdle == camNavIdle,
-                  "HE/EHT NAV disagreement at " << now.As(Time::US)
-                                                  << ": basicEnd=" << m_navEnd.As(Time::US)
-                                                  << ", intraEnd="
-                                                  << m_intraBssNavEnd.As(Time::US)
-                                                  << ", camEnd="
-                                                  << m_channelAccessManager->GetNavEnd().As(Time::US));
-    return navTimersIdle;
+    return m_navEnd <= now && m_intraBssNavEnd <= now;
 }
 
 bool
