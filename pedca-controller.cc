@@ -45,14 +45,18 @@ PedcaController::GetTypeId()
             .AddConstructor<PedcaController>()
             .AddAttribute("Policy",
                           "Which rule set chooses the parameters: kdriven (fitted to the "
-                          "2026-08-01 sweeps), v2 (the original collision/busy/per-station "
-                          "rules), or fixed (push one constant triple)",
+                          "2026-08-01 sweeps), loaddriven (the original airtime integrator), "
+                          "burstadaptive (population prior plus filtered overload guard), v2 "
+                          "(the original collision/busy/per-station rules), or fixed (push one "
+                          "constant triple)",
                           EnumValue(PedcaPolicy::KDRIVEN),
                           MakeEnumAccessor<PedcaPolicy>(&PedcaController::m_policy),
                           MakeEnumChecker(PedcaPolicy::KDRIVEN,
                                           "kdriven",
                                           PedcaPolicy::LOADDRIVEN,
                                           "loaddriven",
+                                          PedcaPolicy::BURSTADAPTIVE,
+                                          "burstadaptive",
                                           PedcaPolicy::V2,
                                           "v2",
                                           PedcaPolicy::FIXED,
@@ -93,6 +97,78 @@ PedcaController::GetTypeId()
                           TimeValue(MicroSeconds(185)),
                           MakeTimeAccessor(&PedcaController::m_burstCost),
                           MakeTimeChecker())
+            .AddAttribute("BurstEwmaAlpha",
+                          "Weight of the newest Stage-1 airtime, urgency and DS-CTS loss "
+                          "samples in the burst-adaptive policy",
+                          DoubleValue(0.25),
+                          MakeDoubleAccessor(&PedcaController::m_burstEwmaAlpha),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("BurstOverheadHigh",
+                          "Filtered Stage-1 airtime above which burst-adaptive votes to raise "
+                          "QSRC. This is separate from the legacy load-driven threshold.",
+                          DoubleValue(0.12),
+                          MakeDoubleAccessor(&PedcaController::m_burstOverheadHigh),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("BurstOverheadLow",
+                          "Filtered Stage-1 airtime below which high urgency may lower QSRC "
+                          "from the q5 overload state to its population prior",
+                          DoubleValue(0.09),
+                          MakeDoubleAccessor(&PedcaController::m_burstOverheadLow),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("BurstCollisionHigh",
+                          "Filtered DS-CTS burst-loss fraction above which burst-adaptive "
+                          "votes to raise QSRC",
+                          DoubleValue(0.50),
+                          MakeDoubleAccessor(&PedcaController::m_burstCollisionHigh),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("BurstMinBursts",
+                          "Minimum DS-CTS bursts in one period before its loss ratio may vote "
+                          "to change QSRC",
+                          UintegerValue(20),
+                          MakeUintegerAccessor(&PedcaController::m_burstMinBursts),
+                          MakeUintegerChecker<uint32_t>(1))
+            .AddAttribute("BurstUpHoldPeriods",
+                          "Consecutive overload periods before burst-adaptive raises QSRC",
+                          UintegerValue(2),
+                          MakeUintegerAccessor(&PedcaController::m_burstUpHoldPeriods),
+                          MakeUintegerChecker<uint32_t>(1))
+            .AddAttribute("BurstDownHoldPeriods",
+                          "Consecutive safe-but-urgent periods before burst-adaptive lowers "
+                          "QSRC toward its population prior",
+                          UintegerValue(5),
+                          MakeUintegerAccessor(&PedcaController::m_burstDownHoldPeriods),
+                          MakeUintegerChecker<uint32_t>(1))
+            .AddAttribute("BurstSmallKMax",
+                          "Largest estimated P-EDCA population assigned BurstQsrcSmall",
+                          UintegerValue(8),
+                          MakeUintegerAccessor(&PedcaController::m_burstSmallKMax),
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("BurstMediumKMax",
+                          "Largest estimated P-EDCA population assigned BurstQsrcMedium",
+                          UintegerValue(22),
+                          MakeUintegerAccessor(&PedcaController::m_burstMediumKMax),
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("BurstQsrcSmall",
+                          "QSRC prior for a small bursty P-EDCA population",
+                          UintegerValue(3),
+                          MakeUintegerAccessor(&PedcaController::m_burstQsrcSmall),
+                          MakeUintegerChecker<uint8_t>(0, PEDCA_QSRC_MAX))
+            .AddAttribute("BurstQsrcMedium",
+                          "QSRC prior for a medium bursty P-EDCA population",
+                          UintegerValue(4),
+                          MakeUintegerAccessor(&PedcaController::m_burstQsrcMedium),
+                          MakeUintegerChecker<uint8_t>(0, PEDCA_QSRC_MAX))
+            .AddAttribute("BurstQsrcLarge",
+                          "QSRC prior for a large bursty P-EDCA population",
+                          UintegerValue(4),
+                          MakeUintegerAccessor(&PedcaController::m_burstQsrcLarge),
+                          MakeUintegerChecker<uint8_t>(0, PEDCA_QSRC_MAX))
+            .AddAttribute("BurstQsrcFloor",
+                          "Hard QSRC floor of burst-adaptive. The default excludes QSRC 0 "
+                          "and the collision-conditioned QSRC 1 operating point.",
+                          UintegerValue(2),
+                          MakeUintegerAccessor(&PedcaController::m_burstQsrcFloor),
+                          MakeUintegerChecker<uint8_t>(2, PEDCA_QSRC_MAX))
             .AddAttribute("KOverride",
                           "Use this value as the number of P-EDCA stations instead of estimating "
                           "it. Negative means estimate. Set it to the true count to measure what "
@@ -299,6 +375,26 @@ PedcaController::KDrivenTheta(uint32_t k) const
     return theta;
 }
 
+uint8_t
+PedcaController::BurstQsrcPrior(uint32_t k) const
+{
+    // k=0 means the LLI-based capability estimator has not observed a P-EDCA station yet;
+    // stay at the safe floor until it has evidence instead of pretending the BSS is small.
+    if (k == 0)
+    {
+        return m_burstQsrcFloor;
+    }
+    if (k <= m_burstSmallKMax)
+    {
+        return std::max(m_burstQsrcFloor, m_burstQsrcSmall);
+    }
+    if (k <= m_burstMediumKMax)
+    {
+        return std::max(m_burstQsrcFloor, m_burstQsrcMedium);
+    }
+    return std::max(m_burstQsrcFloor, m_burstQsrcLarge);
+}
+
 void
 PedcaController::Start(Time when)
 {
@@ -307,7 +403,24 @@ PedcaController::Start(Time when)
 
     Simulator::Schedule(when, [this]() {
         m_cwds = std::min<uint8_t>(m_initialTheta.cwds, m_cwdsMax);
+        m_burstAdaptiveQsrc = std::clamp(std::max(m_initialTheta.qsrcThreshold,
+                                                  m_burstQsrcFloor),
+                                         m_burstQsrcFloor,
+                                         static_cast<uint8_t>(PEDCA_QSRC_MAX));
+        m_lastBurstQsrcPrior = m_burstQsrcFloor;
+        m_burstEwmaReady = false;
+        m_burstCollisionEwmaReady = false;
+        m_overheadEwma = 0.0;
+        m_urgencyEwma = 0.0;
+        m_collisionEwma = 0.0;
+        m_burstUpVotes = 0;
+        m_burstDownVotes = 0;
         ResetObservations();
+
+        // The BSS-wide deltas must start at the same boundary as the PHY observations.
+        // Otherwise the first control period includes all feedback accumulated in warmup.
+        m_lastVoRx = m_fem->GetVoRxCount();
+        m_lastLliTotal = m_fem->GetLliRxCount();
 
         // Snapshot the per-station LLI counters so that the first step sees a delta over the
         // period rather than everything accumulated during warmup.
@@ -489,6 +602,90 @@ PedcaController::Step()
         }
         m_qsrcLoad = std::clamp(m_qsrcLoad, m_qsrcFloor, static_cast<uint8_t>(PEDCA_QSRC_MAX));
     }
+    else if (m_policy == PedcaPolicy::BURSTADAPTIVE)
+    {
+        // The population prior represents the peak number of simultaneously eligible
+        // stations. It rises immediately when the sticky capability estimate enters a new
+        // bucket. The exact On/Off sweep puts q4 and q5 very close but selects q4 for the
+        // best complete triple; q5 is therefore reserved for measured overload instead of
+        // being entered merely because the population is large.
+        const auto qsrcPrior = BurstQsrcPrior(kHat);
+        if (qsrcPrior > m_lastBurstQsrcPrior)
+        {
+            m_burstAdaptiveQsrc = std::max(m_burstAdaptiveQsrc, qsrcPrior);
+        }
+        m_lastBurstQsrcPrior = qsrcPrior;
+        const auto qsrcLower = qsrcPrior;
+
+        if (!m_burstEwmaReady)
+        {
+            m_overheadEwma = overhead;
+            m_urgencyEwma = urgency;
+            m_burstEwmaReady = true;
+        }
+        else
+        {
+            const auto a = m_burstEwmaAlpha;
+            m_overheadEwma = a * overhead + (1.0 - a) * m_overheadEwma;
+            m_urgencyEwma = a * urgency + (1.0 - a) * m_urgencyEwma;
+        }
+
+        // A loss ratio based on a handful of bursts is too quantised to control from (one
+        // missed burst can mean 25-50%).  Only fold adequately sampled periods into this
+        // EWMA, and only let such a period cast an overload vote.
+        const bool collisionSampleValid = m_bursts >= m_burstMinBursts;
+        if (collisionSampleValid)
+        {
+            if (!m_burstCollisionEwmaReady)
+            {
+                m_collisionEwma = collRate;
+                m_burstCollisionEwmaReady = true;
+            }
+            else
+            {
+                const auto a = m_burstEwmaAlpha;
+                m_collisionEwma = a * collRate + (1.0 - a) * m_collisionEwma;
+            }
+        }
+
+        const bool overloaded = (m_overheadEwma > m_burstOverheadHigh) ||
+                                (collisionSampleValid &&
+                                 m_collisionEwma > m_burstCollisionHigh);
+        const bool safeButUrgent = (m_urgencyEwma > m_urgencyHigh) &&
+                                   (m_overheadEwma < m_burstOverheadLow) &&
+                                   (!m_burstCollisionEwmaReady ||
+                                    m_collisionEwma < m_burstCollisionHigh);
+
+        if (overloaded && m_burstAdaptiveQsrc < PEDCA_QSRC_MAX)
+        {
+            m_burstUpVotes++;
+            m_burstDownVotes = 0;
+            if (m_burstUpVotes >= m_burstUpHoldPeriods)
+            {
+                m_burstAdaptiveQsrc++;
+                m_burstUpVotes = 0;
+            }
+        }
+        else if (safeButUrgent && m_burstAdaptiveQsrc > qsrcLower)
+        {
+            m_burstDownVotes++;
+            m_burstUpVotes = 0;
+            if (m_burstDownVotes >= m_burstDownHoldPeriods)
+            {
+                m_burstAdaptiveQsrc--;
+                m_burstDownVotes = 0;
+            }
+        }
+        else
+        {
+            m_burstUpVotes = 0;
+            m_burstDownVotes = 0;
+        }
+
+        m_burstAdaptiveQsrc = std::clamp(m_burstAdaptiveQsrc,
+                                         qsrcLower,
+                                         static_cast<uint8_t>(PEDCA_QSRC_MAX));
+    }
 
     // ---- BSS-wide CWds: jump straight to the target, no step limit ----
     if (dsActive && collRate > m_collHigh)
@@ -526,6 +723,12 @@ PedcaController::Step()
         // free to move, so QSRC carries the whole loop.
         bssWide = PedcaTheta{m_cwdsKDriven, m_qsrcLoad, 3};
     }
+    else if (m_policy == PedcaPolicy::BURSTADAPTIVE)
+    {
+        // The On/Off sweep consistently favours PSRC 3; CWds is a weak dimension, so one
+        // slot of randomisation is retained as cheap protection against Stage-1 ties.
+        bssWide = PedcaTheta{m_cwdsKDriven, m_burstAdaptiveQsrc, 3};
+    }
 
     for (const auto& [aid, addr] : m_apMac->GetStaList(0))
     {
@@ -555,6 +758,7 @@ PedcaController::Step()
         {
         case PedcaPolicy::KDRIVEN:
         case PedcaPolicy::LOADDRIVEN:
+        case PedcaPolicy::BURSTADAPTIVE:
         case PedcaPolicy::FIXED:
             next = bssWide;
             nUnchanged++;

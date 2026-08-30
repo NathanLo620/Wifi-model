@@ -57,6 +57,18 @@ enum class PedcaPolicy
      */
     LOADDRIVEN,
     /**
+     * Bursty-traffic policy calibrated from the On/Off saturation sweep.
+     *
+     * The estimated active P-EDCA population supplies a conservative QSRC prior (3 or 4
+     * as the population grows). Runtime Stage-1 airtime, DS-CTS loss and LLI urgency
+     * refine that operating point with EWMA filtering and asymmetric hold times; in the
+     * largest bucket q4 is the prior and q5 is reserved for measured overload. QSRC 1 is
+     * deliberately excluded: it selects exactly
+     * the stations that have just collided and is therefore the operating point most
+     * exposed to collision-conditioned re-synchronisation.
+     */
+    BURSTADAPTIVE,
+    /**
      * The original rule set: BSS-wide CWds from the DS-CTS collision rate, a global gate on
      * the channel busy fraction, and a per-station choice between an aggressive and a
      * conservative corner. Kept for comparison.
@@ -173,6 +185,9 @@ class PedcaController : public Object
      */
     PedcaTheta KDrivenTheta(uint32_t k) const;
 
+    /** Return the nominal QSRC prior used by the burst-adaptive policy for population k. */
+    uint8_t BurstQsrcPrior(uint32_t k) const;
+
     /**
      * PHY state trace sink, accumulating the time the channel was not idle.
      *
@@ -250,8 +265,30 @@ class PedcaController : public Object
     uint8_t m_qsrcFloor{1};        //!< QSRC never goes below this; 0 is bad at every load
     Time m_burstCost{MicroSeconds(185)}; //!< medium time one Stage-1 burst costs
     uint8_t m_qsrcLoad{2};         //!< the QSRC the load-driven loop currently holds
+    uint8_t m_burstAdaptiveQsrc{2}; //!< QSRC held by the burst-adaptive loop
+    uint8_t m_lastBurstQsrcPrior{2}; //!< previous population prior, for bucket transitions
+    bool m_burstEwmaReady{false};  //!< whether the burst-adaptive EWMAs have a sample
+    bool m_burstCollisionEwmaReady{false}; //!< whether DS-CTS loss has enough samples
+    double m_overheadEwma{0.0};    //!< filtered Stage-1 airtime fraction
+    double m_urgencyEwma{0.0};     //!< filtered fraction of LLI-marked VO frames
+    double m_collisionEwma{0.0};   //!< filtered DS-CTS burst-loss fraction
+    uint32_t m_burstUpVotes{0};    //!< consecutive overload observations
+    uint32_t m_burstDownVotes{0};  //!< consecutive safe-but-urgent observations
     uint32_t m_lastVoRx{0};        //!< AC_VO receive count at the previous step
     uint32_t m_lastLliTotal{0};    //!< BSS-wide LLI count at the previous step
+    double m_burstEwmaAlpha{0.25}; //!< weight of the newest burst-adaptive observation
+    double m_burstOverheadHigh{0.12}; //!< Stage-1 airtime that indicates real overload
+    double m_burstOverheadLow{0.09}; //!< headroom allowing q5 to retreat to q4
+    double m_burstCollisionHigh{0.50}; //!< severe DS-CTS loss that asks for throttling
+    uint32_t m_burstMinBursts{20}; //!< minimum DS-CTS bursts for a collision decision
+    uint32_t m_burstUpHoldPeriods{2}; //!< overload periods required before QSRC is raised
+    uint32_t m_burstDownHoldPeriods{5}; //!< headroom periods required before QSRC is lowered
+    uint32_t m_burstSmallKMax{8};  //!< largest k assigned the small-population QSRC prior
+    uint32_t m_burstMediumKMax{22}; //!< largest k assigned the medium-population QSRC prior
+    uint8_t m_burstQsrcSmall{3};   //!< QSRC prior for a small P-EDCA population
+    uint8_t m_burstQsrcMedium{4};  //!< QSRC prior for a medium P-EDCA population
+    uint8_t m_burstQsrcLarge{4};   //!< QSRC prior for a large P-EDCA population
+    uint8_t m_burstQsrcFloor{2};   //!< hard floor; keeps burst-adaptive out of QSRC 0/1
     Time m_period{MilliSeconds(100)};  //!< control period
     Time m_dsCtsBurstGap{MicroSeconds(100)}; //!< gap above which a DS-CTS starts a new burst
     double m_busyHigh{0.85};           //!< busy fraction above which the congestion gate fires
