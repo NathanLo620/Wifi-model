@@ -124,6 +124,28 @@ QosFrameExchangeManager::GetLliRxCount(Mac48Address addr) const
     return (it == m_lliRxCountByAddr.end()) ? 0 : it->second;
 }
 
+const PedcaSrcStats&
+QosFrameExchangeManager::GetPedcaSrcStats(Mac48Address addr) const
+{
+    static const PedcaSrcStats empty{};
+    const auto it = m_pedcaSrcStatsByAddr.find(addr);
+    return (it == m_pedcaSrcStatsByAddr.end()) ? empty : it->second;
+}
+
+void
+QosFrameExchangeManager::SetPedcaSrcReport(WifiMacHeader& hdr) const
+{
+    // Written unconditionally on every attempt, not just the first: a frame that is being
+    // retransmitted has a larger QSRC than it had last time, and the value the AP must see
+    // is the one that held when the attempt that finally got through was made.
+    if (hdr.HasPedcaSrcReport())
+    {
+        hdr.SetPedcaSrcReport(static_cast<uint8_t>(std::min<uint16_t>(m_qsrc, 15)),
+                              m_psrc,
+                              m_pedcaStage2Active);
+    }
+}
+
 void
 QosFrameExchangeManager::SetQueueSizeAndPedcaLli(WifiMacHeader& hdr,
                                                  Ptr<const WifiMpdu> mpdu,
@@ -1124,6 +1146,13 @@ QosFrameExchangeManager::ForwardMpduDown(Ptr<WifiMpdu> mpdu, WifiTxVector& txVec
             m_mac->GetQosTxop(tid)->GetQosQueueSize(tid,
                                                     mpdu->GetOriginal()->GetHeader().GetAddr1()));
     }
+
+    if (hdr.IsQosData() && m_mac->GetTypeOfStation() == STA)
+    {
+        // Outside the block above on purpose: the report has to go out on every voice frame,
+        // whether or not this one also happens to be carrying a buffer status report.
+        SetPedcaSrcReport(hdr);
+    }
     FrameExchangeManager::ForwardMpduDown(mpdu, txVector);
 }
 
@@ -1483,6 +1512,23 @@ QosFrameExchangeManager::PreProcessFrame(Ptr<const WifiPsdu> psdu, const WifiTxV
         {
             const WifiMacHeader& hdr = mpdu->GetHeader();
 
+            if (hdr.HasPedcaSrcReport())
+            {
+                // The station's own account of what this delivery cost it: how many EDCA
+                // attempts it lost first, how many Stage-1 reservations it spent, and
+                // whether P-EDCA is what finally got the frame through. Unlike the Retry
+                // bit, which only says "more than zero", this is the count itself, so the
+                // AP can build the retry distribution rather than infer it from a one-bit
+                // marginal. Deliberately outside the EOSP gate below: the report rides on
+                // every voice frame, not only on the ones carrying a buffer status report.
+                const auto reporter = mpdu->GetOriginal()->GetHeader().GetAddr2();
+                const auto qsrc = hdr.GetPedcaReportQsrc();
+                const auto psrc = hdr.GetPedcaReportPsrc();
+                const auto stage2 = hdr.GetPedcaReportStage2();
+                m_pedcaSrcStats.Add(qsrc, psrc, stage2);
+                m_pedcaSrcStatsByAddr[reporter].Add(qsrc, psrc, stage2);
+            }
+
             if (hdr.IsQosData() && hdr.IsQosEosp())
             {
                 const auto from = mpdu->GetOriginal()->GetHeader().GetAddr2();
@@ -1498,6 +1544,15 @@ QosFrameExchangeManager::PreProcessFrame(Ptr<const WifiPsdu> psdu, const WifiTxV
                         // Denominator for the LLI ratio: what fraction of the voice frames
                         // arriving are already close to their delay bound.
                         m_voRxCount++;
+                        // A set Retry bit means this frame already lost at least one EDCA
+                        // attempt. Over many frames the fraction that carry it estimates the
+                        // per-attempt failure probability, which is the AP's only view of how
+                        // fast stations accumulate QSRC and therefore of how many of them
+                        // would be eligible at a different threshold.
+                        if (hdr.IsRetry())
+                        {
+                            m_voRetryRxCount++;
+                        }
                     }
                     if (hdr.GetQosLli())
                     {

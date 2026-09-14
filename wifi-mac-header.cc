@@ -13,10 +13,29 @@
 #include "ns3/address-utils.h"
 #include "ns3/nstime.h"
 
+#include <algorithm>
+
 namespace ns3
 {
 
 NS_OBJECT_ENSURE_REGISTERED(WifiMacHeader);
+
+/**
+ * Layout of the P-EDCA Status Report, carried as an A-Control subfield of the HT Control
+ * field. The Control ID identifies it; everything above bit 10 is reserved.
+ *
+ *   bits 0-3   Control ID (PEDCA_SRC_CONTROL_ID)
+ *   bits 4-7   QSRC at transmission, saturating at 15
+ *   bits 8-9   PSRC at transmission, saturating at 3
+ *   bit  10    set when the frame is sent inside a P-EDCA Stage-2 TXOP
+ */
+static constexpr uint32_t PEDCA_SRC_CONTROL_ID = 9;    ///< A-Control ID of the report
+static constexpr uint32_t PEDCA_SRC_CTRLID_MASK = 0xf; ///< width of the Control ID subfield
+static constexpr uint32_t PEDCA_SRC_QSRC_SHIFT = 4;  ///< offset of the QSRC subfield
+static constexpr uint32_t PEDCA_SRC_QSRC_MASK = 0xf; ///< width of the QSRC subfield
+static constexpr uint32_t PEDCA_SRC_PSRC_SHIFT = 8;  ///< offset of the PSRC subfield
+static constexpr uint32_t PEDCA_SRC_PSRC_MASK = 0x3; ///< width of the PSRC subfield
+static constexpr uint32_t PEDCA_SRC_STAGE2_BIT = 10; ///< offset of the Stage-2 flag
 
 /// type enumeration
 enum
@@ -323,6 +342,41 @@ void
 WifiMacHeader::SetNoOrder()
 {
     m_ctrlOrder = 0;
+}
+
+void
+WifiMacHeader::SetPedcaSrcReport(uint8_t qsrc, uint8_t psrc, bool stage2)
+{
+    m_ctrlOrder = 1;
+    m_htControl = PEDCA_SRC_CONTROL_ID |
+                  (std::min<uint32_t>(qsrc, PEDCA_SRC_QSRC_MASK) << PEDCA_SRC_QSRC_SHIFT) |
+                  (std::min<uint32_t>(psrc, PEDCA_SRC_PSRC_MASK) << PEDCA_SRC_PSRC_SHIFT) |
+                  (static_cast<uint32_t>(stage2) << PEDCA_SRC_STAGE2_BIT);
+}
+
+bool
+WifiMacHeader::HasPedcaSrcReport() const
+{
+    return m_ctrlOrder == 1 && IsQosData() &&
+           (m_htControl & PEDCA_SRC_CTRLID_MASK) == PEDCA_SRC_CONTROL_ID;
+}
+
+uint8_t
+WifiMacHeader::GetPedcaReportQsrc() const
+{
+    return (m_htControl >> PEDCA_SRC_QSRC_SHIFT) & PEDCA_SRC_QSRC_MASK;
+}
+
+uint8_t
+WifiMacHeader::GetPedcaReportPsrc() const
+{
+    return (m_htControl >> PEDCA_SRC_PSRC_SHIFT) & PEDCA_SRC_PSRC_MASK;
+}
+
+bool
+WifiMacHeader::GetPedcaReportStage2() const
+{
+    return (m_htControl >> PEDCA_SRC_STAGE2_BIT) & 0x1;
 }
 
 void
@@ -1032,6 +1086,13 @@ WifiMacHeader::GetSize() const
         if (m_ctrlSubtype & 0x08)
         {
             size += 2;
+            if (m_ctrlOrder)
+            {
+                // +HTC: the HT Control field follows the QoS Control field. Only P-EDCA
+                // stations set the Order bit in this model (see SetPedcaSrcReport()), so
+                // for every other frame the length is unchanged.
+                size += 4;
+            }
         }
         break;
     }
@@ -1291,6 +1352,10 @@ WifiMacHeader::Serialize(Buffer::Iterator i) const
         if (m_ctrlSubtype & 0x08)
         {
             i.WriteHtolsbU16(GetQosControl());
+            if (m_ctrlOrder)
+            {
+                i.WriteHtolsbU32(m_htControl);
+            }
         }
     }
     break;
@@ -1344,6 +1409,10 @@ WifiMacHeader::Deserialize(Buffer::Iterator start)
         if (m_ctrlSubtype & 0x08)
         {
             SetQosControl(i.ReadLsbtohU16());
+            if (m_ctrlOrder)
+            {
+                m_htControl = i.ReadLsbtohU32();
+            }
         }
         break;
     }

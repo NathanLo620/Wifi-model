@@ -1808,8 +1808,20 @@ WifiMac::Enqueue(Ptr<Packet> packet, Mac48Address to, Mac48Address from, uint8_t
         hdr.SetQosNoEosp();
         hdr.SetQosNoAmsdu();
         hdr.SetQosTid(tid);
-        hdr.SetNoOrder(); // explicitly set to 0 for the time being since HT control field is not
-                          // yet implemented (set it to 1 when implemented)
+        // The HT Control field is modelled only for the P-EDCA Status Report below; every
+        // other frame leaves the Order bit clear and carries no such field.
+        hdr.SetNoOrder();
+
+        // A P-EDCA station reports its retry state to the AP on every voice frame it
+        // delivers (see WifiMacHeader::SetPedcaSrcReport). The counters are only known at
+        // transmission time, but the four octets the report occupies have to be accounted
+        // for from the moment the MPDU exists, or aggregation and the Duration/ID field
+        // would be computed against a shorter frame than the one that goes on air. So
+        // reserve the field here and let the frame exchange manager fill in the values.
+        if (GetPedcaSupported() && QosUtilsMapTidToAc(tid) == AC_VO)
+        {
+            hdr.SetPedcaSrcReport(0, 0, false);
+        }
     }
     else
     {

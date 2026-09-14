@@ -11,6 +11,9 @@
 
 #include "frame-exchange-manager.h"
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <map>
 #include <optional>
 #include <vector>
@@ -18,6 +21,45 @@
 
 namespace ns3
 {
+
+/**
+ * @ingroup wifi
+ *
+ * What an AP has learned from the P-EDCA Status Reports piggybacked on the voice frames one
+ * station delivered to it.
+ *
+ * A report only reaches the AP on a frame that was actually received, so the counters below
+ * describe successful deliveries: for each one, how many EDCA attempts the station had lost
+ * beforehand (QSRC), how many Stage-1 reservations it had spent (PSRC), and whether the
+ * delivery itself came through a P-EDCA TXOP. The histogram is the point of the exercise --
+ * from it an AP can read off, for any candidate dot11PEDCARetryThreshold, what fraction of
+ * deliveries would have qualified for P-EDCA, without assuming anything about the shape of
+ * the retry distribution.
+ *
+ * All fields are cumulative. A reader that wants one period's worth takes the difference
+ * against its own previous snapshot.
+ */
+struct PedcaSrcStats
+{
+    /// One more than the largest QSRC a report can carry, given the 4-bit subfield.
+    static constexpr std::size_t QSRC_BINS = 16;
+
+    uint32_t reports{0}; //!< voice frames received carrying a report
+    uint64_t qsrcSum{0}; //!< sum of the reported QSRC values
+    uint64_t psrcSum{0}; //!< sum of the reported PSRC values
+    uint32_t stage2{0};  //!< of those frames, how many arrived inside a P-EDCA TXOP
+    std::array<uint32_t, QSRC_BINS> qsrcHist{}; //!< how many reports carried each QSRC value
+
+    /// Add one report to the tally.
+    void Add(uint8_t qsrc, uint8_t psrc, bool stage2Frame)
+    {
+        reports++;
+        qsrcSum += qsrc;
+        psrcSum += psrc;
+        stage2 += stage2Frame ? 1 : 0;
+        qsrcHist[std::min<std::size_t>(qsrc, QSRC_BINS - 1)]++;
+    }
+};
 
 /**
  * @ingroup wifi
@@ -87,6 +129,31 @@ class QosFrameExchangeManager : public FrameExchangeManager
      * @return the cumulative AC_VO receive count
      */
     uint32_t GetVoRxCount() const { return m_voRxCount; }
+
+    /**
+     * @return AC_VO frames received carrying the Retry bit, cumulative.
+     *
+     * Divided by GetVoRxCount() this is the fraction of voice frames that needed more than
+     * one EDCA attempt, which the model-predictive policy uses to estimate the per-attempt
+     * failure probability.
+     */
+    uint32_t GetVoRetryRxCount() const { return m_voRetryRxCount; }
+
+    /**
+     * P-EDCA Status Reports received from every station, summed BSS-wide.
+     *
+     * Only meaningful at an AP. See PedcaSrcStats for what the fields mean.
+     *
+     * @return the cumulative BSS-wide report tally
+     */
+    const PedcaSrcStats& GetPedcaSrcStats() const { return m_pedcaSrcStats; }
+    /**
+     * P-EDCA Status Reports received from one station.
+     *
+     * @param addr the station to look up
+     * @return that station's cumulative tally, or an empty one if it never reported
+     */
+    const PedcaSrcStats& GetPedcaSrcStats(Mac48Address addr) const;
     /**
      * Number of LLI-marked frames received from one station.
      *
@@ -285,6 +352,21 @@ class QosFrameExchangeManager : public FrameExchangeManager
      */
     void SetQueueSizeAndPedcaLli(WifiMacHeader& hdr, Ptr<const WifiMpdu> mpdu, uint8_t queueSize);
 
+    /**
+     * Fill in the P-EDCA Status Report of a frame that is about to be transmitted.
+     *
+     * The four octets were reserved when the MPDU was created (WifiMac::Enqueue), so this
+     * only writes values and never changes the frame length. Frames that did not reserve
+     * the field -- anything from a station that is not running P-EDCA, and every access
+     * category other than AC_VO -- are left alone.
+     *
+     * Called from the write point of whichever frame exchange manager is in use: this class
+     * for non-HT, HtFrameExchangeManager::FinalizeMacHeader() for everything newer.
+     *
+     * @param hdr the header of the frame about to go on air
+     */
+    void SetPedcaSrcReport(WifiMacHeader& hdr) const;
+
     Ptr<QosTxop> m_edca;                      //!< the EDCAF that gained channel access
     std::optional<Mac48Address> m_txopHolder; //!< MAC address of the TXOP holder
     bool m_setQosQueueSize;                   /**< whether to set the Queue Size subfield of the
@@ -367,6 +449,9 @@ class QosFrameExchangeManager : public FrameExchangeManager
     bool   m_resetPsrcOnLimitChange{false};   //!< whether SetPsrc() also clears the PSRC counter
     uint32_t m_lliRxCount{0};                 //!< LLI-marked frames received (AP side)
     uint32_t m_voRxCount{0};                  //!< AC_VO frames received (AP side)
+    uint32_t m_voRetryRxCount{0};             //!< AC_VO frames received with the Retry bit
+    PedcaSrcStats m_pedcaSrcStats;            //!< BSS-wide P-EDCA Status Report tally (AP side)
+    std::map<Mac48Address, PedcaSrcStats> m_pedcaSrcStatsByAddr; //!< the same, per station
     std::map<Mac48Address, uint32_t> m_lliRxCountByAddr; //!< LLI-marked frames received, per station
 
 

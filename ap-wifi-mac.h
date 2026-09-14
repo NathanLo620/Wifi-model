@@ -106,6 +106,16 @@ class ApWifiMac : public WifiMac
      * @return the interval between two beacon transmissions.
      */
     Time GetBeaconInterval() const;
+    /**
+     * How long until the next beacon goes out on a link. A closed-loop controller that
+     * advertises its decisions in the beacon needs this to place its decision instant just
+     * before one, so that a freshly computed parameter table is not held for most of a
+     * beacon interval before any station hears it.
+     *
+     * @param linkId the link to ask about
+     * @return the time left until the next beacon, or zero if none is scheduled
+     */
+    Time GetTimeToNextBeacon(uint8_t linkId) const;
 
     /**
      * Get a const reference to the map of associated stations on the given link.

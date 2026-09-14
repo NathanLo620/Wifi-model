@@ -298,6 +298,38 @@ class WifiMacHeader : public Header
     void SetNoOrder();
 
     /**
+     * Install a P-EDCA Status Report in the HT Control (+HTC) field of a QoS Data frame.
+     *
+     * The report is how a P-EDCA station tells its AP what its retry state looked like at
+     * the instant this frame went on air: QSRC counts the EDCA attempts the station has
+     * already lost for this access category, PSRC counts the consecutive Stage-1 (DS-CTS)
+     * reservations it has spent since the last success, and the Stage-2 flag says whether
+     * this particular frame is being delivered inside a P-EDCA TXOP or by ordinary EDCA.
+     * Both counters are reset on success, so the values that reach the AP on a delivered
+     * frame are exactly the cost that delivery incurred.
+     *
+     * Calling this sets the Order (+HTC) bit, which adds four octets to the header. Call it
+     * once when the MPDU is created so that the length is accounted for everywhere, and
+     * again just before transmission to write the values that are current by then; only the
+     * first call changes the frame length.
+     *
+     * @param qsrc the station's QSRC, saturating at 15
+     * @param psrc the station's PSRC, saturating at 3
+     * @param stage2 whether this frame is being sent inside a P-EDCA Stage-2 TXOP
+     */
+    void SetPedcaSrcReport(uint8_t qsrc, uint8_t psrc, bool stage2);
+    /**
+     * @return whether this frame carries a P-EDCA Status Report (see SetPedcaSrcReport())
+     */
+    bool HasPedcaSrcReport() const;
+    /** @return the QSRC value carried by the P-EDCA Status Report */
+    uint8_t GetPedcaReportQsrc() const;
+    /** @return the PSRC value carried by the P-EDCA Status Report */
+    uint8_t GetPedcaReportPsrc() const;
+    /** @return whether the reporting frame was sent inside a P-EDCA Stage-2 TXOP */
+    bool GetPedcaReportStage2() const;
+
+    /**
      * Return the address in the Address 1 field.
      *
      * @return the address in the Address 1 field
@@ -714,6 +746,7 @@ class WifiMacHeader : public Header
     uint8_t m_qosAckPolicy{0}; ///< QoS Ack policy
     uint8_t m_amsduPresent{0}; ///< A-MSDU present
     uint8_t m_qosStuff{0};     ///< QoS stuff
+    uint32_t m_htControl{0};   ///< HT Control (+HTC) field, present when the Order bit is set
 };
 
 } // namespace ns3

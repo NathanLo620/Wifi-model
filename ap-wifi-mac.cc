@@ -400,6 +400,13 @@ ApWifiMac::GetBeaconInterval() const
     return m_beaconInterval;
 }
 
+Time
+ApWifiMac::GetTimeToNextBeacon(uint8_t linkId) const
+{
+    const auto& ev = GetLink(linkId).beaconEvent;
+    return ev.IsPending() ? Simulator::GetDelayLeft(ev) : Time{0};
+}
+
 void
 ApWifiMac::SetLinkUpCallback(Callback<void> linkUp)
 {

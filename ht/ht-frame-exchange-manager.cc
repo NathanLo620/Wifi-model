@@ -1339,6 +1339,14 @@ HtFrameExchangeManager::FinalizeMacHeader(Ptr<const WifiPsdu> psdu)
                 SetQueueSizeAndPedcaLli(hdr, mpdu, queueSizeForTid[tid].value());
             }
 
+            if (m_mac->GetTypeOfStation() == STA)
+            {
+                // Outside the block above on purpose: the P-EDCA Status Report goes out on
+                // every voice frame, whether or not this one is also carrying a buffer
+                // status report.
+                SetPedcaSrcReport(hdr);
+            }
+
             if (m_mac->GetTypeOfStation() == AP && m_apMac->UseGcr(hdr) &&
                 m_apMac->GetGcrManager()->UseConcealment(mpdu->GetHeader()))
             {
