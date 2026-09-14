@@ -1167,10 +1167,17 @@ WifiRemoteStationManager::DoIncrementRetryCountOnTxFailure(WifiRemoteStation* st
     //   attribute is set to true
     const auto& hdr = psdu->GetHeader(0);
 
+    // Upstream ns-3.45 had a misplaced parenthesis here: `hdr.GetQosTid() ||
+    // m_incrRetryCountUnderBa` was passed as the *tid* argument, so for AC_VO (TID 6) the
+    // expression collapsed to the boolean 1 and the BA agreement of TID 1 (AC_BK) was
+    // queried instead. QoS Data under an established BA agreement therefore had its retry
+    // count incremented and was dropped at FrameRetryLimit, contrary to
+    // Sec. 10.23.2.12.1 of 802.11-2020 and to this class's own IncrementRetryCountUnderBa
+    // documentation. Restored to the ns-3.46+ form.
     if (hdr.IsMgt() || (hdr.IsData() && !hdr.IsQosData()) ||
-        (hdr.IsQosData() && (!m_wifiMac->GetBaAgreementEstablishedAsOriginator(
-                                hdr.GetAddr1(),
-                                hdr.GetQosTid() || m_incrRetryCountUnderBa))))
+        (hdr.IsQosData() &&
+         (!m_wifiMac->GetBaAgreementEstablishedAsOriginator(hdr.GetAddr1(), hdr.GetQosTid()) ||
+          m_incrRetryCountUnderBa)))
     {
         psdu->IncrementRetryCount();
     }
